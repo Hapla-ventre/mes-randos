@@ -77,7 +77,7 @@ async function onAuthed(user) {
 // Bumped whenever the elevation/gain-loss/slope math changes in a way worth recomputing old
 // hikes for. Each hike stores the version it was last computed with; on login, any hike behind
 // this number gets its numbers refreshed automatically — nothing else about it is touched.
-const ELEVATION_SCHEMA_VERSION = 4;
+const ELEVATION_SCHEMA_VERSION = 5;
 
 async function migrateOutdatedElevations() {
   const outdated = hikes.filter((h) => h.elevationSchemaVersion < ELEVATION_SCHEMA_VERSION && h.coordinates.length > 1);
@@ -722,69 +722,59 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
   const filteredSelf = {};
   hikeList.forEach((h) => { filteredSelf[h.id] = filterRuns(h.coordinates.length, (i) => selfMatchIndex[h.id][i] !== -1); });
 
-  // The "track" a given point of a given hike belongs to: its own id, or — once it's confirmed to
-  // be retracing its own path — id+"#a"/"#b" depending on which of the two passes this is. Two
-  // different hikes overlapping the SAME physical trail at the same spot always get two distinct
-  // keys (different ids); a single hike's out-and-back gets two distinct keys too (different
-  // suffix) — so no two genuinely different tracks can ever collide onto the same key.
-  function trackKeyFor(hikeId, i) {
-    return filteredSelf[hikeId][i] ? hikeId + (i < selfMatchIndex[hikeId][i] ? "#a" : "#b") : hikeId;
-  }
-
-  // Pass 2: which OTHER tracks are within threshold at each point — kept per-partner, not summed
-  // yet, so the run-length filter can be applied per pair. "Other" here means any track (via
-  // trackKeyFor, so pass-aware) whose key differs from this point's own — which covers both a
-  // different hike's line AND this hike's own opposite pass meeting back up with itself. Treating
-  // both cases through the same key comparison is what lets a point simultaneously separate from
-  // its own return leg AND from a different hike overlapping the same spot, instead of only one.
+  // Pass 2: which OTHER hikes are within threshold at each point — kept per-partner, not summed
+  // yet, so the run-length filter can be applied per pair. Deliberately simple (keyed by hikeId
+  // only, no pass-splitting): an earlier version tried to rank every coincident track (self pass +
+  // every nearby other hike) by sorted position, which fixed the exact-cancellation bug below but
+  // introduced a worse one — in a spot where several hikes converge, which OTHER hikes happen to be
+  // "in range" shifts as you walk along, so an ordinal position among a fluctuating set jumped
+  // around erratically instead of easing smoothly. Independent, fixed-magnitude per-partner
+  // contributions (like this) only ever change gradually as a partner enters/exits range.
   const otherSets = {};
   hikeList.forEach((h) => { otherSets[h.id] = h.coordinates.map(() => new Set()); });
-  hikeList.forEach((h) => {
-    h.coordinates.forEach(([lat, lng], i) => {
-      const ownKey = trackKeyFor(h.id, i);
-      neighborsOf(lat, lng).forEach((q) => {
-        if (q.hikeId === h.id) {
-          if (Math.abs(q.i - i) < OVERLAP_MIN_SELF_INDEX_GAP) return;
-        } else if (!includeOtherHikes) {
-          return;
-        }
-        if (haversineMeters([lat, lng], [q.lat, q.lng]) >= OVERLAP_THRESHOLD_M) return;
-        const key = trackKeyFor(q.hikeId, q.i);
-        if (key !== ownKey) otherSets[h.id][i].add(key);
+  if (includeOtherHikes) {
+    hikeList.forEach((h) => {
+      h.coordinates.forEach(([lat, lng], i) => {
+        neighborsOf(lat, lng).forEach((q) => {
+          if (q.hikeId === h.id) return;
+          if (haversineMeters([lat, lng], [q.lat, q.lng]) < OVERLAP_THRESHOLD_M) otherSets[h.id][i].add(q.hikeId);
+        });
       });
     });
-  });
+  }
   const filteredOtherSets = {};
   hikeList.forEach((h) => {
     const raw = otherSets[h.id];
     const n = raw.length;
     const filtered = raw.map(() => new Set());
     const partners = new Set();
-    raw.forEach((s) => s.forEach((key) => partners.add(key)));
-    partners.forEach((key) => {
-      filterRuns(n, (i) => raw[i].has(key)).forEach((keep, i) => { if (keep) filtered[i].add(key); });
+    raw.forEach((s) => s.forEach((id) => partners.add(id)));
+    partners.forEach((otherId) => {
+      filterRuns(n, (i) => raw[i].has(otherId)).forEach((keep, i) => { if (keep) filtered[i].add(otherId); });
     });
     filteredOtherSets[h.id] = filtered;
   });
 
-  // Raw per-point rank: every distinct track present at this point (this hike's own — via
-  // trackKeyFor, so an out-and-back's two passes count separately — plus each coincident OTHER
-  // track, also pass-aware) is sorted by a fixed key so the order never depends on "who's nearby
-  // right now", then this point's own track gets its ordinal position, centered around 0. This
-  // used to instead SUM a ±0.5 self contribution with a ±0.5 per-partner contribution, which could
-  // cancel out to exactly 0 — e.g. an out-and-back's own pass landing on the "wrong" side of a
-  // same-color coincidence with another hike — leaving that stretch completely unoffset and hidden
-  // under whatever it overlapped. Ordinal ranking can't cancel: with N tracks present, each one
-  // gets its own slot. Still a little jittery at the edges of a genuine overlap, hence the
-  // smoothing pass right after.
+  // Raw per-point rank: self-overlap contributes a fixed ±SELF_STEP (earlier pass vs. later pass
+  // of the SAME hike always take opposite sides), and each coincident OTHER hike independently
+  // contributes ±0.5 via a fixed per-pair id comparison — not "sort whoever's nearby right now",
+  // which let a hike's side flip depending on transient company. Any sum of ±0.5 terms is always a
+  // multiple of 0.5, so choosing SELF_STEP = 0.75 — exactly halfway between two such multiples —
+  // guarantees the self contribution can never be exactly cancelled out by however many other
+  // hikes pile on (the previous ±0.5-for-both version could land on exactly 0, e.g. an
+  // out-and-back's own pass landing on the "wrong" side of a same-color coincidence with another
+  // hike, leaving that stretch completely unoffset and hidden under whatever it overlapped).
+  const SELF_STEP = 0.75;
   const rawRanks = {};
   hikeList.forEach((h) => {
     rawRanks[h.id] = h.coordinates.map((_, i) => {
-      const ownKey = trackKeyFor(h.id, i);
-      const tracks = [ownKey, ...filteredOtherSets[h.id][i]];
-      if (tracks.length === 1) return 0;
-      tracks.sort();
-      return tracks.indexOf(ownKey) - (tracks.length - 1) / 2;
+      let sum = 0;
+      if (filteredSelf[h.id][i]) {
+        const matchedIdx = selfMatchIndex[h.id][i];
+        sum += i < matchedIdx ? -SELF_STEP : SELF_STEP;
+      }
+      filteredOtherSets[h.id][i].forEach((otherId) => { sum += (h.id < otherId ? -1 : 1) / 2; });
+      return sum;
     });
   });
 
@@ -1173,7 +1163,18 @@ async function fetchElevations(points) {
 // batch migration ran through many of them back to back.
 async function fetchElevationChunkWithRetry(lats, lons, attempt = 0) {
   const res = await fetch(`https://api.open-meteo.com/v1/elevation?latitude=${lats}&longitude=${lons}`);
-  if (res.ok) return (await res.json()).elevation;
+  if (res.ok) {
+    const elevation = (await res.json()).elevation;
+    // Every downstream calculation (gain/loss, chart, max slope) assumes elevation[i] is the
+    // altitude of points[i] — if the API ever returned a different count than requested (a
+    // dedup of identical coordinate pairs, a partial response, anything), every point from there
+    // on would silently pair with the WRONG elevation and throw off every derived number, slope
+    // most visibly since it divides by a short distance. Treat a count mismatch as a failure
+    // worth retrying rather than silently computing on misaligned data.
+    const expected = lats.split(",").length;
+    if (elevation.length !== expected) throw new Error(`Elevation count mismatch: got ${elevation.length}, expected ${expected}`);
+    return elevation;
+  }
   if (res.status === 429 && attempt < 3) {
     await new Promise((resolve) => setTimeout(resolve, 1500 * (attempt + 1)));
     return fetchElevationChunkWithRetry(lats, lons, attempt + 1);
@@ -1184,14 +1185,27 @@ async function fetchElevationChunkWithRetry(lats, lons, attempt = 0) {
 // A single bad altitude sample (a DEM void or glitch — happens occasionally, especially near
 // cliffs, bridges, or forest edges) can still throw off a moving average even over a wide window,
 // since it's still one of the values being averaged. Replace anything wildly out of step with
-// its immediate neighbors by their median before smoothing even starts, so the rest of the curve
-// doesn't inherit its distortion.
-function rejectElevationOutliers(elevations, thresholdM = 40) {
+// its neighbors' median before smoothing even starts, so the rest of the curve doesn't inherit
+// its distortion. Distance-based (not a fixed ±3 points) for the same reason smoothElevations is:
+// routed geometry is dense on curves and sparse on straights, so a fixed point-count window can
+// span anywhere from a couple of meters to hundreds depending on where you are on the path. A
+// real-world window also means dozens of samples get pooled into the median wherever points are
+// dense, so a short RUN of several consecutive bad samples (not just one) still gets outvoted —
+// a fixed ±3-point window has no such margin and can itself be entirely bad neighbors.
+function rejectElevationOutliers(coords, elevations, thresholdM = 40, windowMeters = 60) {
   return elevations.map((e, i) => {
     const neighbors = [];
-    for (let d = 1; d <= 3; d++) {
-      if (i - d >= 0) neighbors.push(elevations[i - d]);
-      if (i + d < elevations.length) neighbors.push(elevations[i + d]);
+    let dist = 0;
+    for (let j = i - 1; j >= 0; j--) {
+      dist += haversineMeters(coords[j], coords[j + 1]);
+      if (dist > windowMeters) break;
+      neighbors.push(elevations[j]);
+    }
+    dist = 0;
+    for (let j = i + 1; j < elevations.length; j++) {
+      dist += haversineMeters(coords[j - 1], coords[j]);
+      if (dist > windowMeters) break;
+      neighbors.push(elevations[j]);
     }
     if (neighbors.length === 0) return e;
     neighbors.sort((a, b) => a - b);
@@ -1211,7 +1225,7 @@ function rejectElevationOutliers(elevations, thresholdM = 40) {
 //   window to blend away, so the chart needs its own wider pass to look like a real profile
 //   instead of a flight of stairs.
 function deriveElevationStats(coords, rawElevations) {
-  const cleaned = rejectElevationOutliers(rawElevations);
+  const cleaned = rejectElevationOutliers(coords, rawElevations);
   const gainLossElevations = smoothElevations(coords, cleaned, 5);
   const { gain, loss } = computeGainLossHysteresis(gainLossElevations);
   const displayElevations = smoothElevations(coords, cleaned, 25);
