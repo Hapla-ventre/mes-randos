@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Mes Randos</title>
+
+<link rel="stylesheet" href="vendor/leaflet/leaflet.css" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<div id="login-screen" class="login-screen">
+  <div class="login-box">
+    <h1>Mes Randos</h1>
+    <p class="hint">Connecte-toi (ou crée ton compte) pour accéder à ta carte.</p>
+    <input id="login-email" type="email" placeholder="Email" autocomplete="username" />
+    <input id="login-password" type="password" placeholder="Mot de passe" autocomplete="current-password" />
+    <div class="login-actions">
+      <button id="btn-signin">Se connecter</button>
+      <button id="btn-signup" class="secondary">Créer un compte</button>
+    </div>
+    <p id="login-error" class="error"></p>
+  </div>
+</div>
+
+<div id="app" class="app hidden">
+  <aside id="sidebar" class="sidebar">
+    <div class="sidebar-header">
+      <h1>Mes Randos</h1>
+      <button id="btn-logout" title="Se déconnecter">⏻</button>
+    </div>
+
+    <button id="btn-new-hike" class="btn-primary">+ Nouvelle rando</button>
+
+    <div id="draw-panel" class="draw-panel hidden">
+      <p class="hint">Clique sur la carte pour placer les points de ton tracé.</p>
+      <div class="draw-actions">
+        <button id="btn-undo-point" class="secondary">↩ Annuler point</button>
+        <button id="btn-finish-draw" class="btn-primary">Terminer le tracé</button>
+        <button id="btn-cancel-draw" class="secondary">Annuler</button>
+      </div>
+      <p id="draw-stats" class="draw-stats"></p>
+    </div>
+
+    <div id="save-panel" class="save-panel hidden">
+      <input id="hike-name" type="text" placeholder="Nom de la rando" />
+      <input id="hike-date" type="date" />
+      <textarea id="hike-notes" placeholder="Notes (optionnel)"></textarea>
+      <div id="hike-stats-preview" class="stats-preview"></div>
+      <div class="draw-actions">
+        <button id="btn-save-hike" class="btn-primary">Enregistrer</button>
+        <button id="btn-cancel-save" class="secondary">Annuler</button>
+      </div>
+    </div>
+
+    <div id="hike-list" class="hike-list"></div>
+  </aside>
+
+  <main class="map-wrap">
+    <div id="map"></div>
+    <div id="detail-panel" class="detail-panel hidden">
+      <button id="btn-close-detail" class="close-btn">✕</button>
+      <h2 id="detail-name"></h2>
+      <p id="detail-date" class="hint"></p>
+      <div id="detail-stats" class="stats-preview"></div>
+      <p id="detail-notes"></p>
+      <canvas id="elevation-profile" width="300" height="90"></canvas>
+      <button id="btn-delete-hike" class="danger">Supprimer cette rando</button>
+    </div>
+  </main>
+</div>
+
+<script src="vendor/leaflet/leaflet.js"></script>
+<script src="vendor/supabase.js"></script>
+<script src="config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
