@@ -34,7 +34,7 @@
     <button id="btn-new-hike" class="btn-primary">+ Nouvelle rando</button>
 
     <div id="draw-panel" class="draw-panel hidden">
-      <p class="hint">Clique sur la carte pour poser des points (A, B, C…) — l'itinéraire suit les sentiers entre eux. Glisse un point pour le corriger.</p>
+      <p id="draw-hint" class="hint">Clique sur la carte pour poser des points (A, B, C…) — l'itinéraire suit les sentiers entre eux. Glisse un point pour le corriger.</p>
       <div class="draw-actions">
         <button id="btn-undo-point" class="secondary">↩ Annuler point</button>
         <button id="btn-finish-draw" class="btn-primary">Terminer le tracé</button>
@@ -69,12 +69,14 @@
       <div id="detail-extra-info" class="extra-info"></div>
       <p id="detail-notes"></p>
       <canvas id="elevation-profile" width="300" height="90"></canvas>
+      <button id="btn-edit-hike" class="secondary" style="width:100%;margin-top:12px">✎ Modifier cette rando</button>
       <button id="btn-delete-hike" class="danger">Supprimer cette rando</button>
     </div>
   </main>
 </div>
 
 <script src="vendor/leaflet/leaflet.js"></script>
+<script src="vendor/leaflet/leaflet.polylineDecorator.js"></script>
 <script src="vendor/firebase/firebase-app-compat.js"></script>
 <script src="vendor/firebase/firebase-auth-compat.js"></script>
 <script src="vendor/firebase/firebase-firestore-compat.js"></script>

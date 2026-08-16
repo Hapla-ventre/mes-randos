@@ -3,20 +3,21 @@ firebase.initializeApp(window.APP_CONFIG);
 const auth = firebase.auth();
 const db = firebase.firestore();
 
-const HIKE_STYLE_DEFAULT = { color: "#7d8f7d", weight: 3, opacity: 0.55 };
-const HIKE_STYLE_SELECTED = { color: "#c0392b", weight: 5, opacity: 0.95 };
-const HIKE_STYLE_DIMMED = { color: "#7d8f7d", weight: 3, opacity: 0.2 };
-const DRAW_COLOR = "#c0392b";
+const COLOR_DEFAULT = "#c0392b";  // rando au repos
+const COLOR_SELECTED = "#c0392b"; // rando sélectionnée (rayures blanc/rouge)
+const COLOR_EDITING = "#2980b9";  // rando en cours de modification / création
 
 let leafletMap;
 let hikes = [];               // loaded from Firestore
-let hikeLayers = {};          // id -> leaflet polyline
+let hikeLayers = {};          // id -> { group, line }
 let activeHikeId = null;
 
 let drawing = false;
+let editingHikeId = null;     // id of the hike being modified, or null when creating a new one
+let editingHikeData = null;   // full hike object being modified, for prefilling the save form
 let waypointMarkers = [];     // draggable L.marker[], in click order (A, B, C…)
 let waypointLayer = null;     // layer group holding the markers
-let routeLayer = null;        // visible polyline for the route currently being drawn
+let routeLayer = null;        // visible polyline for the route currently being drawn/edited
 let routeResult = null;       // { coordinates, elevations, distanceKm, gainM, lossM, maxSlopePct, surfaceSummary, routed }
 let rerouteTimer = null;
 let rerouteToken = 0;
@@ -80,7 +81,14 @@ function initMapIfNeeded() {
     { attribution: "&copy; IGN Géoplateforme", maxZoom: 19 }
   );
 
-  L.control.layers({ "OpenStreetMap": osm, "IGN": ign }).addTo(leafletMap);
+  // Courbes de niveau + estompage (relief ombré) — rendus pré-calculés par OpenTopoMap à partir
+  // du même type de données (SRTM) que les cartes IGN papier, pas de calcul de relief côté client.
+  const relief = L.tileLayer("https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png", {
+    attribution: "&copy; OpenTopoMap (CC-BY-SA), données SRTM",
+    maxZoom: 17,
+  });
+
+  L.control.layers({ "OpenStreetMap": osm, "IGN": ign, "Relief (courbes + ombrage)": relief }).addTo(leafletMap);
 
   leafletMap.on("click", onMapClick);
 }
@@ -144,7 +152,7 @@ async function rebuildRoute() {
 
   routeResult = result;
   if (routeLayer) leafletMap.removeLayer(routeLayer);
-  routeLayer = L.polyline(result.coordinates, { color: DRAW_COLOR, weight: 4, opacity: 0.9 }).addTo(leafletMap);
+  routeLayer = L.polyline(result.coordinates, { color: COLOR_EDITING, weight: 4, opacity: 0.9 }).addTo(leafletMap);
   renderDrawStats(positions.length);
 }
 
@@ -169,12 +177,38 @@ document.getElementById("btn-save-hike").addEventListener("click", saveHike);
 
 function startDrawing() {
   closeDetail();
+  editingHikeId = null;
+  editingHikeData = null;
   resetDrawingState();
   drawing = true;
   waypointLayer = L.layerGroup().addTo(leafletMap);
   document.getElementById("btn-new-hike").classList.add("hidden");
+  document.getElementById("draw-hint").textContent =
+    "Clique sur la carte pour poser des points (A, B, C…) — l'itinéraire suit les sentiers entre eux. Glisse un point pour le corriger.";
+  document.getElementById("btn-finish-draw").textContent = "Terminer le tracé";
   drawPanel.classList.remove("hidden");
   renderDrawStats(0);
+}
+
+function startEditingHike(hike) {
+  closeDetail();
+  editingHikeId = hike.id;
+  editingHikeData = hike;
+  renderHikeLayers(); // rebuild without this hike's static layer — it's now the live editable one
+
+  resetDrawingState();
+  drawing = true;
+  waypointLayer = L.layerGroup().addTo(leafletMap);
+  document.getElementById("btn-new-hike").classList.add("hidden");
+  document.getElementById("draw-hint").textContent =
+    "Glisse les points pour corriger le tracé, ajoutes-en en cliquant sur la carte, puis termine.";
+  document.getElementById("btn-finish-draw").textContent = "Terminer la modification";
+  drawPanel.classList.remove("hidden");
+
+  hike.waypoints.forEach((pos) => addWaypoint(L.latLng(pos[0], pos[1])));
+
+  const bounds = L.polyline(hike.coordinates).getBounds();
+  leafletMap.fitBounds(bounds, { padding: [40, 40] });
 }
 
 function resetDrawingState() {
@@ -187,9 +221,13 @@ function resetDrawingState() {
 
 function cancelDrawing() {
   drawing = false;
+  const wasEditing = editingHikeId !== null;
+  editingHikeId = null;
+  editingHikeData = null;
   resetDrawingState();
   drawPanel.classList.add("hidden");
   document.getElementById("btn-new-hike").classList.remove("hidden");
+  if (wasEditing) renderHikeLayers(); // bring back the hike's static layer, unchanged
 }
 
 async function finishDrawing() {
@@ -205,7 +243,14 @@ async function finishDrawing() {
 
   drawPanel.classList.add("hidden");
   savePanel.classList.remove("hidden");
-  document.getElementById("hike-date").valueAsDate = new Date();
+  document.getElementById("hike-name").value = editingHikeData ? editingHikeData.name : "";
+  document.getElementById("hike-notes").value = editingHikeData ? (editingHikeData.notes || "") : "";
+  if (editingHikeData && editingHikeData.date) {
+    document.getElementById("hike-date").value = editingHikeData.date;
+  } else {
+    document.getElementById("hike-date").valueAsDate = new Date();
+  }
+  document.getElementById("btn-save-hike").textContent = editingHikeId ? "Enregistrer les modifications" : "Enregistrer";
 
   pendingStats = routeResult;
   renderStatsPreview("hike-stats-preview", { distanceKm: pendingStats.distanceKm, gainM: pendingStats.gainM, lossM: pendingStats.lossM });
@@ -232,11 +277,15 @@ async function saveHike() {
     maxSlopePct: pendingStats.maxSlopePct,
     surfaceSummary: pendingStats.surfaceSummary,
     routed: pendingStats.routed,
-    createdAt: firebase.firestore.FieldValue.serverTimestamp(),
   };
 
   try {
-    await db.collection("hikes").add(payload);
+    if (editingHikeId) {
+      await db.collection("hikes").doc(editingHikeId).update(payload);
+    } else {
+      payload.createdAt = firebase.firestore.FieldValue.serverTimestamp();
+      await db.collection("hikes").add(payload);
+    }
   } catch (err) {
     alert("Erreur à l'enregistrement : " + err.message);
     return;
@@ -244,8 +293,11 @@ async function saveHike() {
 
   document.getElementById("hike-name").value = "";
   document.getElementById("hike-notes").value = "";
+  document.getElementById("btn-save-hike").textContent = "Enregistrer";
   savePanel.classList.add("hidden");
   document.getElementById("btn-new-hike").classList.remove("hidden");
+  editingHikeId = null;
+  editingHikeData = null;
   resetDrawingState();
 
   await loadHikes();
@@ -296,7 +348,7 @@ function renderHikeList() {
     const el = document.createElement("div");
     el.className = "hike-item" + (isActive ? " active" : "");
     el.innerHTML = `
-      <div class="name"><span class="swatch" style="background:${isActive ? HIKE_STYLE_SELECTED.color : HIKE_STYLE_DEFAULT.color}"></span>${escapeHtml(h.name)}</div>
+      <div class="name"><span class="swatch" style="background:${COLOR_DEFAULT}"></span>${escapeHtml(h.name)}</div>
       <div class="meta">${h.date ? formatDate(h.date) : "Sans date"} · ${h.distanceKm != null ? h.distanceKm.toFixed(1) + " km" : ""}${h.elevationGainM != null ? " · D+ " + Math.round(h.elevationGainM) + " m" : ""}</div>
     `;
     el.addEventListener("click", () => showDetail(h.id));
@@ -304,26 +356,47 @@ function renderHikeList() {
   });
 }
 
-function renderHikeLayers() {
-  Object.values(hikeLayers).forEach((l) => leafletMap.removeLayer(l));
-  hikeLayers = {};
-  hikes.forEach((h) => {
-    const line = L.polyline(h.coordinates, HIKE_STYLE_DEFAULT)
-      .addTo(leafletMap)
-      .on("click", () => showDetail(h.id));
-    line.bindTooltip(h.name);
-    hikeLayers[h.id] = line;
-  });
+// Builds the map layers for one hike: the line itself (default red, selected red/white
+// stripes, or editing blue) plus arrowheads along it showing the direction of travel.
+function buildHikeLayerGroup(coords, state) {
+  const group = L.layerGroup();
+  let line;
+
+  if (state === "selected") {
+    L.polyline(coords, { color: "#ffffff", weight: 6, opacity: 1 }).addTo(group);
+    line = L.polyline(coords, { color: COLOR_SELECTED, weight: 6, opacity: 1, dashArray: "12,12" }).addTo(group);
+  } else if (state === "editing") {
+    line = L.polyline(coords, { color: COLOR_EDITING, weight: 5, opacity: 0.95 }).addTo(group);
+  } else {
+    line = L.polyline(coords, { color: COLOR_DEFAULT, weight: 4, opacity: 0.9 }).addTo(group);
+  }
+
+  const arrowColor = state === "editing" ? COLOR_EDITING : COLOR_DEFAULT;
+  L.polylineDecorator(line, {
+    patterns: [{
+      offset: "5%",
+      repeat: "10%",
+      symbol: L.Symbol.arrowHead({
+        pixelSize: 9,
+        polygon: true,
+        pathOptions: { color: arrowColor, fillColor: arrowColor, fillOpacity: 1, weight: 0 },
+      }),
+    }],
+  }).addTo(group);
+
+  return { group, line };
 }
 
-function applyHikeStyles(selectedId) {
-  Object.entries(hikeLayers).forEach(([id, line]) => {
-    if (!selectedId) {
-      line.setStyle(HIKE_STYLE_DEFAULT);
-      return;
-    }
-    line.setStyle(id === selectedId ? HIKE_STYLE_SELECTED : HIKE_STYLE_DIMMED);
-    if (id === selectedId) line.bringToFront();
+function renderHikeLayers() {
+  Object.values(hikeLayers).forEach(({ group }) => leafletMap.removeLayer(group));
+  hikeLayers = {};
+  hikes.forEach((h) => {
+    if (h.id === editingHikeId) return; // this hike is currently shown as the live editable route instead
+    const { group, line } = buildHikeLayerGroup(h.coordinates, h.id === activeHikeId ? "selected" : "default");
+    group.addTo(leafletMap);
+    line.on("click", () => showDetail(h.id));
+    line.bindTooltip(h.name);
+    hikeLayers[h.id] = { group, line };
   });
 }
 
@@ -349,9 +422,9 @@ function showDetail(id) {
   drawElevationProfile(h.elevations);
   detailPanel.classList.remove("hidden");
 
-  applyHikeStyles(id);
-  const line = hikeLayers[id];
-  if (line) leafletMap.fitBounds(line.getBounds(), { padding: [40, 40] });
+  renderHikeLayers();
+  const layer = hikeLayers[id];
+  if (layer) leafletMap.fitBounds(layer.line.getBounds(), { padding: [40, 40] });
 }
 
 document.getElementById("btn-close-detail").addEventListener("click", closeDetail);
@@ -359,8 +432,13 @@ function closeDetail() {
   activeHikeId = null;
   detailPanel.classList.add("hidden");
   renderHikeList();
-  applyHikeStyles(null);
+  renderHikeLayers();
 }
+
+document.getElementById("btn-edit-hike").addEventListener("click", () => {
+  const h = hikes.find((x) => x.id === activeHikeId);
+  if (h) startEditingHike(h);
+});
 
 document.getElementById("btn-delete-hike").addEventListener("click", async () => {
   if (!activeHikeId) return;

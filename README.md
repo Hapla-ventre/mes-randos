@@ -68,14 +68,22 @@ Le site se met à jour automatiquement en ~1 minute (GitHub Pages).
 - **↩ Annuler point** retire le dernier point posé. **Terminer le tracé** fige distance, dénivelé, pente
   max et type de terrain.
 - Donne un nom, une date, des notes éventuelles, puis **Enregistrer**.
-- La carte affiche toutes tes randos en gris discret, comme une toile de tes parcours. Clique sur une rando
-  (liste ou carte) pour la faire ressortir en couleur, voir ses stats, son profil d'altitude, et la supprimer.
+- Sur la carte, une rando enregistrée est **rouge avec des flèches** indiquant le sens de parcours. En la
+  sélectionnant (liste ou clic sur la carte) elle passe en **rayures rouge/blanc** pour bien ressortir, et
+  tu peux voir ses stats, son profil d'altitude, la modifier ou la supprimer depuis le panneau qui s'ouvre.
+- **✎ Modifier cette rando** repasse en mode édition : la rando devient **bleue**, ses points redeviennent
+  déplaçables/ajoutables comme à la création. Enregistrer met à jour la même rando (pas de doublon).
+- Le sélecteur de calques (haut à droite) propose un fond **Relief** avec courbes de niveau et estompage,
+  en plus d'OpenStreetMap et IGN.
 
 ## Notes techniques
 
 - Le dénivelé et le type de terrain viennent d'OpenRouteService quand le tracé est routé ; sans clé, ou si
   l'itinéraire est indisponible, l'app trace une ligne directe et calcule l'altitude via Open-Meteo (~90m de résolution).
-- Fond de carte IGN disponible via le sélecteur de calques en haut à droite (plus lisible pour la rando en France).
+- Le fond **Relief** utilise les tuiles pré-calculées d'OpenTopoMap (courbes de niveau + ombrage à partir de
+  données SRTM) — comme la plupart des applis de rando, l'estompage n'est pas recalculé à la volée dans le
+  navigateur, ce serait beaucoup trop coûteux pour un rendu à la demande.
+- Fond de carte IGN disponible via le même sélecteur (plus lisible pour la rando en France).
 - Aucune donnée n'est envoyée ailleurs qu'à ton propre projet Firebase, à OpenRouteService (pour le calcul d'itinéraire)
   et à Open-Meteo (altitude, en secours, anonyme et sans clé).
 - Leaflet et le SDK Firebase sont embarqués localement dans `vendor/` (pas de dépendance à un CDN externe).
@@ -83,5 +91,5 @@ Le site se met à jour automatiquement en ~1 minute (GitHub Pages).
   elles ne donnent pas d'accès). Ce qui protège vraiment tes données, ce sont les règles Firestore
   ([`firestore.rules`](firestore.rules)) et la restriction de la clé API à `hapla-ventre.github.io` faite dans
   Google Cloud Console.
-- L'édition ne concerne que le tracé en cours : une rando déjà enregistrée ne peut pas être re-modifiée pour
-  l'instant (seulement consultée ou supprimée) — à ajouter plus tard si besoin.
+- Les flèches de direction et le style rayé viennent du plugin Leaflet.PolylineDecorator, également
+  embarqué dans `vendor/`.
