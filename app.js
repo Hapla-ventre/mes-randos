@@ -9,7 +9,7 @@ const COLOR_EDITING = "#2980b9";  // rando en cours de modification / création
 // Bumped by hand on every change, shown in the sidebar footer — GitHub Pages can take a minute to
 // actually serve a new push, and the browser can also just be showing a cached copy, so this is
 // the one reliable way to confirm you're testing the version you think you're testing.
-const APP_VERSION = "v15 · 2026-08-17";
+const APP_VERSION = "v16 · 2026-08-17";
 document.getElementById("app-version").textContent = APP_VERSION;
 
 let leafletMap;
@@ -799,48 +799,48 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
     filteredOtherSets[h.id] = filtered;
   });
 
-  // Raw per-point rank: self-overlap contributes a fixed ±SELF_STEP (earlier pass vs. later pass
-  // of the SAME hike always take opposite sides), and each coincident OTHER hike independently
-  // contributes ±0.5 via a fixed per-pair id comparison — not "sort whoever's nearby right now",
-  // which let a hike's side flip depending on transient company. Any sum of ±0.5 terms is always a
-  // multiple of 0.5, so choosing SELF_STEP = 0.75 — exactly halfway between two such multiples —
-  // guarantees the self contribution can never be exactly cancelled out by however many other
-  // hikes pile on (the previous ±0.5-for-both version could land on exactly 0, e.g. an
-  // out-and-back's own pass landing on the "wrong" side of a same-color coincidence with another
-  // hike, leaving that stretch completely unoffset and hidden under whatever it overlapped).
-  const SELF_STEP = 0.75;
-  const rawRanks = {};
+  // Self-overlap and cross-hike overlap get fundamentally different treatment now: a hike's own
+  // out-and-back is the SAME color either way, so there's nothing to visually tell apart — nudging
+  // the two passes to either side just drew two clearly separate parallel lines where a single
+  // trail should read as one. Instead, wherever the LATER pass (i > matchedIdx) meets its own
+  // earlier pass, its point is SNAPPED to sit exactly on the earlier pass's coordinate — the two
+  // passes become pixel-identical there instead of merely close, which is what "the same rando on
+  // the same trail" should look like: one line, not a gap and not the old jittery near-duplicate
+  // either (jittery because "close but not quite" is worse than either "identical" or "offset").
+  // A different hike overlapping the same spot is a genuinely different color worth distinguishing,
+  // so that part keeps the small perpendicular nudge — computed completely independently of self,
+  // so the two mechanisms can no longer interact or partially cancel each other.
+  const rawOtherRanks = {};
   hikeList.forEach((h) => {
-    rawRanks[h.id] = h.coordinates.map((_, i) => {
+    rawOtherRanks[h.id] = h.coordinates.map((_, i) => {
       let sum = 0;
-      if (filteredSelf[h.id][i]) {
-        const matchedIdx = selfMatchIndex[h.id][i];
-        sum += i < matchedIdx ? -SELF_STEP : SELF_STEP;
-      }
       filteredOtherSets[h.id][i].forEach((otherId) => { sum += (h.id < otherId ? -1 : 1) / 2; });
       return sum;
     });
   });
 
-  // Smooth the rank along each hike's own sequence so the offset eases in and out gradually
+  // Smooth the cross-hike rank along each hike's own sequence so it eases in and out gradually
   // instead of snapping between sides — that snapping is what read as jagged "zigzags" before.
   const clusters = {};
   hikeList.forEach((h) => {
-    const raw = rawRanks[h.id];
+    const raw = rawOtherRanks[h.id];
     const coords = h.coordinates;
     clusters[h.id] = raw.map((_, i) => {
       const start = Math.max(0, i - OVERLAP_SMOOTH_WINDOW);
       const end = Math.min(raw.length, i + OVERLAP_SMOOTH_WINDOW + 1);
       let sum = 0;
       for (let j = start; j < end; j++) sum += raw[j];
-      const rank = sum / (end - start);
-      if (Math.abs(rank) < 0.05) return null;
+      const otherRank = sum / (end - start);
+
+      const matchedIdx = filteredSelf[h.id][i] ? selfMatchIndex[h.id][i] : -1;
+      const selfSnapToIndex = matchedIdx !== -1 && i > matchedIdx ? matchedIdx : null;
+      if (Math.abs(otherRank) < 0.05 && selfSnapToIndex === null) return null;
 
       const prev = coords[Math.max(0, i - 1)];
       const next = coords[Math.min(coords.length - 1, i + 1)];
       const dLat = next[0] - prev[0], dLng = next[1] - prev[1];
       const len = Math.hypot(dLat, dLng) || 1;
-      return { rank, perpLat: -dLng / len, perpLng: dLat / len };
+      return { otherRank, selfSnapToIndex, perpLat: -dLng / len, perpLng: dLat / len };
     });
   });
 
@@ -854,11 +854,22 @@ function applyOverlapClusters(hikeList, clusters, zoom) {
   hikeList.forEach((h) => {
     const clusterInfo = clusters[h.id];
     result[h.id] = h.coordinates.map(([lat, lng], i) => {
-      const info = clusterInfo && clusterInfo[i];
+      let info = clusterInfo && clusterInfo[i];
       if (!info) return [lat, lng];
-      const offsetStepM = 8 * metersPerPixel(lat, zoom); // 8px gap, enough to clear the halo'd line width
-      const offsetDeg = (info.rank * offsetStepM) / 111320;
-      return [lat + info.perpLat * offsetDeg, lng + info.perpLng * offsetDeg];
+      let baseLat = lat, baseLng = lng;
+      if (info.selfSnapToIndex != null) {
+        // Inherit the earlier pass's own cross-hike offset info wholesale here too, not just its
+        // coordinate — this point's own perpendicular direction runs opposite to the earlier
+        // pass's (they travel in opposite directions along the same trail), so applying ITS OWN
+        // offset from the shared base would immediately shove the two "merged" points apart again,
+        // in opposite directions, undoing the whole point of snapping them together.
+        [baseLat, baseLng] = h.coordinates[info.selfSnapToIndex];
+        info = clusterInfo[info.selfSnapToIndex] || null;
+      }
+      if (!info || !info.otherRank) return [baseLat, baseLng];
+      const offsetStepM = 8 * metersPerPixel(baseLat, zoom); // 8px gap, enough to clear the halo'd line width
+      const offsetDeg = (info.otherRank * offsetStepM) / 111320;
+      return [baseLat + info.perpLat * offsetDeg, baseLng + info.perpLng * offsetDeg];
     });
   });
   return result;
