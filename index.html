@@ -69,13 +69,14 @@
     <div id="map"></div>
     <div id="detail-panel" class="detail-panel hidden">
       <button id="btn-close-detail" class="close-btn">✕</button>
-      <h2 id="detail-name"></h2>
-      <p id="detail-date" class="hint"></p>
+      <input id="detail-name-input" type="text" class="detail-name-input" placeholder="Nom de la rando" />
+      <input id="detail-date-input" type="date" class="detail-date-input" />
       <div id="detail-stats" class="stats-preview"></div>
       <div id="detail-extra-info" class="extra-info"></div>
-      <p id="detail-notes"></p>
+      <textarea id="detail-notes-input" placeholder="Notes (optionnel)"></textarea>
+      <button id="btn-save-info" class="secondary" style="width:100%">💾 Enregistrer nom / date / notes</button>
       <canvas id="elevation-profile" width="300" height="90"></canvas>
-      <button id="btn-edit-hike" class="secondary" style="width:100%;margin-top:12px">✎ Modifier cette rando</button>
+      <button id="btn-edit-hike" class="secondary" style="width:100%;margin-top:12px">✎ Modifier le tracé</button>
       <button id="btn-delete-hike" class="danger">Supprimer cette rando</button>
     </div>
   </main>

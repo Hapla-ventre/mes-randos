@@ -100,6 +100,8 @@ function initMapIfNeeded() {
   L.control.layers({ "OpenStreetMap": osm, "IGN": ign, "Relief (courbes + ombrage)": relief }).addTo(leafletMap);
 
   leafletMap.on("click", onMapClick);
+  // the metro-style offset targets a constant pixel gap, so it has to be recomputed on zoom
+  leafletMap.on("zoomend", () => { if (distinctColorsEnabled) renderHikeLayers(); });
 }
 
 let suppressNextMapClick = false;
@@ -478,15 +480,19 @@ function renderHikeList() {
 function buildHikeLayerGroup(coords, state, baseColor) {
   const group = L.layerGroup();
   const color = baseColor || COLOR_DEFAULT;
+  const lineWeight = state === "selected" ? 6 : state === "editing" ? 5 : 4;
   let line;
 
+  // White halo under every state, not just when selected, so the line itself stays legible
+  // over dark/busy basemaps (satellite, relief) the same way the arrowheads already do.
+  L.polyline(coords, { color: "#ffffff", weight: lineWeight + 3, opacity: 1 }).addTo(group);
+
   if (state === "selected") {
-    L.polyline(coords, { color: "#ffffff", weight: 6, opacity: 1 }).addTo(group);
-    line = L.polyline(coords, { color, weight: 6, opacity: 1, dashArray: "12,12" }).addTo(group);
+    line = L.polyline(coords, { color, weight: lineWeight, opacity: 1, dashArray: "12,12" }).addTo(group);
   } else if (state === "editing") {
-    line = L.polyline(coords, { color: COLOR_EDITING, weight: 5, opacity: 0.95 }).addTo(group);
+    line = L.polyline(coords, { color: COLOR_EDITING, weight: lineWeight, opacity: 0.95 }).addTo(group);
   } else {
-    line = L.polyline(coords, { color, weight: 4, opacity: 0.9 }).addTo(group);
+    line = L.polyline(coords, { color, weight: lineWeight, opacity: 0.95 }).addTo(group);
   }
 
   // Pixel offsets/repeat (not "%") so spacing tracks the map's current scale: zoom in and more
@@ -496,10 +502,10 @@ function buildHikeLayerGroup(coords, state, baseColor) {
       offset: 20,
       repeat: 90,
       symbol: L.Symbol.arrowHead({
-        pixelSize: 12,
-        headAngle: 50,       // narrower angle reads more clearly as a direction arrow
+        pixelSize: 13,
+        headAngle: 32,        // narrow tip angle = a clean, unmistakably isosceles triangle
         polygon: true,
-        pathOptions: { color: "#ffffff", weight: 2, fillColor: "#161616", fillOpacity: 1, lineJoin: "round" },
+        pathOptions: { color: "#ffffff", weight: 1.5, fillColor: "#161616", fillOpacity: 1, lineJoin: "miter" },
       }),
     }],
   }).addTo(group);
@@ -535,13 +541,23 @@ function colorForHikeId(id) {
   return DISTINCT_COLORS[hash % DISTINCT_COLORS.length];
 }
 
+// Roughly how many meters one screen pixel covers at a given latitude/zoom (standard Web
+// Mercator tile math) — lets the offset target a constant screen gap instead of a constant
+// real-world one, so it neither vanishes when zoomed out nor looks absurdly wide zoomed in.
+function metersPerPixel(lat, zoom) {
+  return (156543.03392 * Math.cos((lat * Math.PI) / 180)) / Math.pow(2, zoom);
+}
+
 // Approximation, not true segment-level route bundling: wherever two hikes pass within
-// OFFSET_THRESHOLD_M of each other, nudge them apart perpendicular to their direction so they
-// read like parallel metro lines instead of one solid stack. Everywhere else, paths stay exact.
+// OFFSET_THRESHOLD_M of each other in reality, nudge them apart perpendicular to their
+// direction so they read like parallel metro lines instead of one solid stack. Everywhere
+// else, paths stay exact. The "are they close" check is a fixed real-world distance; the
+// visual gap itself is computed in pixels so it holds steady as the map is zoomed.
 function computeOverlapOffsets(hikeList) {
   const OFFSET_THRESHOLD_M = 12;
-  const OFFSET_STEP_M = 4;
+  const OFFSET_PIXELS = 4;
   const marginDeg = OFFSET_THRESHOLD_M / 111320;
+  const zoom = leafletMap.getZoom();
 
   const boxes = hikeList.map((h) => boundsOf(h.coordinates));
   const result = {};
@@ -576,7 +592,8 @@ function computeOverlapOffsets(hikeList) {
       const dLat = next[0] - prev[0], dLng = next[1] - prev[1];
       const len = Math.hypot(dLat, dLng) || 1;
       const perpLat = -dLng / len, perpLng = dLat / len;
-      const offsetDeg = (rank * OFFSET_STEP_M) / 111320;
+      const offsetStepM = OFFSET_PIXELS * metersPerPixel(lat, zoom);
+      const offsetDeg = (rank * offsetStepM) / 111320;
       return [lat + perpLat * offsetDeg, lng + perpLng * offsetDeg];
     });
   });
@@ -618,9 +635,9 @@ function showDetail(id) {
 
   renderHikeList();
 
-  document.getElementById("detail-name").textContent = h.name;
-  document.getElementById("detail-date").textContent = h.date ? formatDate(h.date) : "";
-  document.getElementById("detail-notes").textContent = h.notes || "";
+  document.getElementById("detail-name-input").value = h.name;
+  document.getElementById("detail-date-input").value = h.date || "";
+  document.getElementById("detail-notes-input").value = h.notes || "";
   renderStatsPreview("detail-stats", {
     distanceKm: h.distanceKm,
     gainM: h.elevationGainM,
@@ -646,6 +663,23 @@ function closeDetail() {
 document.getElementById("btn-edit-hike").addEventListener("click", () => {
   const h = hikes.find((x) => x.id === activeHikeId);
   if (h) startEditingHike(h);
+});
+
+// Quick edit for name/date/notes only — no need to touch the route just to fix a typo or a date.
+document.getElementById("btn-save-info").addEventListener("click", async () => {
+  if (!activeHikeId) return;
+  const name = document.getElementById("detail-name-input").value.trim() || "Rando sans nom";
+  const date = document.getElementById("detail-date-input").value || null;
+  const notes = document.getElementById("detail-notes-input").value.trim();
+  try {
+    await db.collection("hikes").doc(activeHikeId).update({ name, date, notes });
+  } catch (err) {
+    alert("Erreur : " + err.message);
+    return;
+  }
+  const id = activeHikeId;
+  await loadHikes();
+  showDetail(id);
 });
 
 document.getElementById("btn-delete-hike").addEventListener("click", async () => {
@@ -773,7 +807,7 @@ async function fetchOrsRoute(positions) {
     // and compute D+/D- ourselves (ORS's own ascent/descent sums every bit of that same DEM
     // noise with no filtering, which is why it ran noticeably higher than other apps).
     const rawElevations = feature.geometry.coordinates.map((c) => c[2] ?? 0);
-    const elevations = smoothElevations(rawElevations, 5);
+    const elevations = smoothElevations(coords, rawElevations, 5);
     const { gain, loss } = computeGainLossHysteresis(elevations);
     const props = feature.properties || {};
     const distanceKm = (props.summary && props.summary.distance != null ? props.summary.distance : pathDistanceKm(coords) * 1000) / 1000;
@@ -799,7 +833,7 @@ async function fallbackStraightRoute(positions) {
   try {
     const dense = densifyPath(positions, 30);
     const rawElevations = await fetchElevations(dense);
-    const elevations = smoothElevations(rawElevations);
+    const elevations = smoothElevations(dense, rawElevations, 5);
     const { gain, loss } = computeGainLossHysteresis(elevations);
     return {
       coordinates: dense,
@@ -890,14 +924,30 @@ async function fetchElevations(points) {
   return elevations;
 }
 
-// Simple moving average, just to take the edge off per-vertex DEM noise before it's charted
-// or fed to the gain/loss algorithm below.
-function smoothElevations(elevations, window = 3) {
+// Moving average over a fixed real-world distance rather than a fixed point count: routed
+// geometry isn't evenly spaced (dense on curves, sparse on straights), so a point-count window
+// covers a different — and unpredictable — number of meters depending on where you are on the
+// path. A distance window stays meaningful everywhere and doesn't over- or under-smooth.
+function smoothElevations(coords, elevations, windowMeters = 5) {
+  const half = windowMeters / 2;
   return elevations.map((_, i) => {
-    const start = Math.max(0, i - window);
-    const end = Math.min(elevations.length, i + window + 1);
-    const slice = elevations.slice(start, end);
-    return slice.reduce((a, b) => a + b, 0) / slice.length;
+    let sum = elevations[i];
+    let count = 1;
+    let dist = 0;
+    for (let j = i - 1; j >= 0; j--) {
+      dist += haversineMeters(coords[j], coords[j + 1]);
+      if (dist > half) break;
+      sum += elevations[j];
+      count++;
+    }
+    dist = 0;
+    for (let j = i + 1; j < elevations.length; j++) {
+      dist += haversineMeters(coords[j - 1], coords[j]);
+      if (dist > half) break;
+      sum += elevations[j];
+      count++;
+    }
+    return sum / count;
   });
 }
 
