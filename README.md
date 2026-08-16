@@ -28,8 +28,8 @@ Le site est déjà en ligne : https://hapla-ventre.github.io/mes-randos/
    colle le contenu, puis remplace chaque valeur par celles de ton `firebaseConfig` (étape 5 ci-dessus).
 3. Commit directement sur `main`. Le site se met à jour tout seul en ~1 minute.
 
-(`config.js` n'est pas dans le dépôt de base exprès — sur ton PC, `config.js` reste ignoré par git,
-donc si tu modifies le code en local pense à le recréer toi-même avec tes clés pour tester.)
+(`config.js` est bien versionné sur GitHub — c'est ce qui permet à GitHub Pages de le servir. Ce n'est pas un souci
+de sécurité : ces valeurs Firebase ne sont pas des secrets, voir la note à ce sujet plus bas.)
 
 ### 3. Créer ton compte dans l'app
 
@@ -79,5 +79,9 @@ Le site se met à jour automatiquement en ~1 minute (GitHub Pages).
 - Aucune donnée n'est envoyée ailleurs qu'à ton propre projet Firebase, à OpenRouteService (pour le calcul d'itinéraire)
   et à Open-Meteo (altitude, en secours, anonyme et sans clé).
 - Leaflet et le SDK Firebase sont embarqués localement dans `vendor/` (pas de dépendance à un CDN externe).
+- `config.js` est public sur GitHub — c'est normal pour une app Firebase web (ces clés identifient le projet,
+  elles ne donnent pas d'accès). Ce qui protège vraiment tes données, ce sont les règles Firestore
+  ([`firestore.rules`](firestore.rules)) et la restriction de la clé API à `hapla-ventre.github.io` faite dans
+  Google Cloud Console.
 - L'édition ne concerne que le tracé en cours : une rando déjà enregistrée ne peut pas être re-modifiée pour
   l'instant (seulement consultée ou supprimée) — à ajouter plus tard si besoin.
