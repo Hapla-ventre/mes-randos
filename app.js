@@ -3,14 +3,14 @@ firebase.initializeApp(window.APP_CONFIG);
 const auth = firebase.auth();
 const db = firebase.firestore();
 
-const COLOR_DEFAULT = "#c0392b";  // rando au repos
-const COLOR_SELECTED = "#c0392b"; // rando sélectionnée (rayures blanc/rouge)
+const COLOR_DEFAULT = "#c0392b";  // rando au repos (ou sélectionnée, en rayures blanc/rouge)
 const COLOR_EDITING = "#2980b9";  // rando en cours de modification / création
 
 let leafletMap;
 let hikes = [];               // loaded from Firestore
 let hikeLayers = {};          // id -> { group, line }
 let activeHikeId = null;
+let distinctColorsEnabled = localStorage.getItem("distinctColors") === "1";
 
 let drawing = false;
 let editingHikeId = null;     // id of the hike being modified, or null when creating a new one
@@ -66,6 +66,15 @@ function onAuthed(user) {
   }
 }
 
+const chkDistinctColors = document.getElementById("chk-distinct-colors");
+chkDistinctColors.checked = distinctColorsEnabled;
+chkDistinctColors.addEventListener("change", () => {
+  distinctColorsEnabled = chkDistinctColors.checked;
+  localStorage.setItem("distinctColors", distinctColorsEnabled ? "1" : "0");
+  renderHikeList();
+  renderHikeLayers();
+});
+
 // ---------- Map ----------
 function initMapIfNeeded() {
   if (leafletMap) return;
@@ -103,23 +112,69 @@ function waypointLabel(index) {
   return index < 26 ? String.fromCharCode(65 + index) : String(index + 1);
 }
 
-function createWaypointMarker(latlng, index) {
-  const icon = L.divIcon({
+function waypointIcon(index) {
+  return L.divIcon({
     className: "",
     html: `<div class="waypoint-icon"><span>${waypointLabel(index)}</span></div>`,
-    iconSize: [26, 26],
-    iconAnchor: [13, 26],
+    iconSize: [34, 34],
+    iconAnchor: [17, 34],
   });
-  const marker = L.marker(latlng, { icon, draggable: true }).addTo(waypointLayer);
+}
+
+function createWaypointMarker(latlng, index) {
+  const marker = L.marker(latlng, { icon: waypointIcon(index), draggable: true, zIndexOffset: 1000 }).addTo(waypointLayer);
   marker.on("dragend", scheduleReroute);
   return marker;
+}
+
+// Re-applies A, B, C… labels in current array order — needed after an insert or a delete
+// anywhere but the end, since points keep their position but their index shifts.
+function relabelWaypoints() {
+  waypointMarkers.forEach((m, i) => m.setIcon(waypointIcon(i)));
 }
 
 function addWaypoint(latlng) {
   const marker = createWaypointMarker(latlng, waypointMarkers.length);
   waypointMarkers.push(marker);
+  renderWaypointList();
   renderDrawStats(waypointMarkers.length, "computing");
   scheduleReroute();
+}
+
+function insertWaypoint(index, latlng) {
+  const marker = createWaypointMarker(latlng, index);
+  waypointMarkers.splice(index, 0, marker);
+  relabelWaypoints();
+  renderWaypointList();
+}
+
+function removeWaypointAt(index) {
+  const marker = waypointMarkers[index];
+  if (!marker) return;
+  if (waypointLayer) waypointLayer.removeLayer(marker);
+  waypointMarkers.splice(index, 1);
+  relabelWaypoints();
+  renderWaypointList();
+  renderDrawStats(waypointMarkers.length, "computing");
+  scheduleReroute();
+}
+
+function renderWaypointList() {
+  const el = document.getElementById("waypoint-list");
+  el.innerHTML = "";
+  waypointMarkers.forEach((m, i) => {
+    const row = document.createElement("div");
+    row.className = "waypoint-row";
+    row.innerHTML = `<span class="waypoint-row-label">${waypointLabel(i)}</span><span class="waypoint-row-hint">glisse sur la carte pour déplacer</span>`;
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "waypoint-row-del";
+    del.title = "Supprimer ce point";
+    del.textContent = "✕";
+    del.addEventListener("click", () => removeWaypointAt(i));
+    row.appendChild(del);
+    el.appendChild(row);
+  });
 }
 
 function currentWaypointPositions() {
@@ -152,8 +207,57 @@ async function rebuildRoute() {
 
   routeResult = result;
   if (routeLayer) leafletMap.removeLayer(routeLayer);
-  routeLayer = L.polyline(result.coordinates, { color: COLOR_EDITING, weight: 4, opacity: 0.9 }).addTo(leafletMap);
+  routeLayer = L.polyline(result.coordinates, {
+    color: COLOR_EDITING, weight: 4, opacity: 0.9, className: "route-line-editable",
+  }).addTo(leafletMap);
+  routeLayer.on("mousedown", onRouteLineMouseDown);
   renderDrawStats(positions.length);
+}
+
+// Grab the route line itself (not one of the lettered points) to insert a new point right there
+// and drag it into place — this is how you "pull" the path onto a different street/trail.
+function onRouteLineMouseDown(e) {
+  if (!drawing) return;
+  if (e.originalEvent) L.DomEvent.stop(e.originalEvent);
+  leafletMap.dragging.disable();
+
+  const index = findInsertIndex(e.latlng);
+  insertWaypoint(index, e.latlng);
+  const marker = waypointMarkers[index];
+
+  function onMove(ev) {
+    marker.setLatLng(ev.latlng);
+  }
+  function onUp() {
+    leafletMap.off("mousemove", onMove);
+    leafletMap.off("mouseup", onUp);
+    leafletMap.dragging.enable();
+    scheduleReroute();
+  }
+  leafletMap.on("mousemove", onMove);
+  leafletMap.on("mouseup", onUp);
+}
+
+// Finds which existing segment (between waypoint i and i+1) a point is closest to, so an
+// inserted point lands at the right place in the A→B→C… sequence.
+function findInsertIndex(latlng) {
+  const positions = currentWaypointPositions();
+  if (positions.length < 2) return positions.length;
+  let bestIndex = positions.length;
+  let bestDist = Infinity;
+  for (let i = 0; i < positions.length - 1; i++) {
+    const d = distanceToSegment([latlng.lat, latlng.lng], positions[i], positions[i + 1]);
+    if (d < bestDist) { bestDist = d; bestIndex = i + 1; }
+  }
+  return bestIndex;
+}
+
+// Planar approximation (fine at hiking-route scale) of the distance from a point to a segment.
+function distanceToSegment([px, py], [ax, ay], [bx, by]) {
+  const dx = bx - ax, dy = by - ay;
+  if (dx === 0 && dy === 0) return Math.hypot(px - ax, py - ay);
+  const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)));
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
 }
 
 // ---------- Draw hike flow ----------
@@ -165,6 +269,7 @@ document.getElementById("btn-cancel-draw").addEventListener("click", cancelDrawi
 document.getElementById("btn-undo-point").addEventListener("click", () => {
   const marker = waypointMarkers.pop();
   if (marker && waypointLayer) waypointLayer.removeLayer(marker);
+  renderWaypointList();
   renderDrawStats(waypointMarkers.length, "computing");
   scheduleReroute();
 });
@@ -217,6 +322,7 @@ function resetDrawingState() {
   if (waypointLayer) { leafletMap.removeLayer(waypointLayer); waypointLayer = null; }
   if (routeLayer) { leafletMap.removeLayer(routeLayer); routeLayer = null; }
   routeResult = null;
+  document.getElementById("waypoint-list").innerHTML = "";
 }
 
 function cancelDrawing() {
@@ -347,8 +453,9 @@ function renderHikeList() {
     const isActive = h.id === activeHikeId;
     const el = document.createElement("div");
     el.className = "hike-item" + (isActive ? " active" : "");
+    const swatchColor = distinctColorsEnabled ? colorForHikeId(h.id) : COLOR_DEFAULT;
     el.innerHTML = `
-      <div class="name"><span class="swatch" style="background:${COLOR_DEFAULT}"></span>${escapeHtml(h.name)}</div>
+      <div class="name"><span class="swatch" style="background:${swatchColor}"></span>${escapeHtml(h.name)}</div>
       <div class="meta">${h.date ? formatDate(h.date) : "Sans date"} · ${h.distanceKm != null ? h.distanceKm.toFixed(1) + " km" : ""}${h.elevationGainM != null ? " · D+ " + Math.round(h.elevationGainM) + " m" : ""}</div>
     `;
     el.addEventListener("click", () => showDetail(h.id));
@@ -356,30 +463,31 @@ function renderHikeList() {
   });
 }
 
-// Builds the map layers for one hike: the line itself (default red, selected red/white
-// stripes, or editing blue) plus arrowheads along it showing the direction of travel.
-function buildHikeLayerGroup(coords, state) {
+// Builds the map layers for one hike: the line itself (default red — or a distinct color when
+// that mode is on —, selected red/white stripes, or editing blue) plus black/white-outlined
+// arrowheads along it showing the direction of travel, legible against any basemap.
+function buildHikeLayerGroup(coords, state, baseColor) {
   const group = L.layerGroup();
+  const color = baseColor || COLOR_DEFAULT;
   let line;
 
   if (state === "selected") {
     L.polyline(coords, { color: "#ffffff", weight: 6, opacity: 1 }).addTo(group);
-    line = L.polyline(coords, { color: COLOR_SELECTED, weight: 6, opacity: 1, dashArray: "12,12" }).addTo(group);
+    line = L.polyline(coords, { color, weight: 6, opacity: 1, dashArray: "12,12" }).addTo(group);
   } else if (state === "editing") {
     line = L.polyline(coords, { color: COLOR_EDITING, weight: 5, opacity: 0.95 }).addTo(group);
   } else {
-    line = L.polyline(coords, { color: COLOR_DEFAULT, weight: 4, opacity: 0.9 }).addTo(group);
+    line = L.polyline(coords, { color, weight: 4, opacity: 0.9 }).addTo(group);
   }
 
-  const arrowColor = state === "editing" ? COLOR_EDITING : COLOR_DEFAULT;
   L.polylineDecorator(line, {
     patterns: [{
       offset: "5%",
       repeat: "10%",
       symbol: L.Symbol.arrowHead({
-        pixelSize: 9,
+        pixelSize: 11,
         polygon: true,
-        pathOptions: { color: arrowColor, fillColor: arrowColor, fillOpacity: 1, weight: 0 },
+        pathOptions: { color: "#ffffff", weight: 2.5, fillColor: "#161616", fillOpacity: 1 },
       }),
     }],
   }).addTo(group);
@@ -390,14 +498,102 @@ function buildHikeLayerGroup(coords, state) {
 function renderHikeLayers() {
   Object.values(hikeLayers).forEach(({ group }) => leafletMap.removeLayer(group));
   hikeLayers = {};
-  hikes.forEach((h) => {
-    if (h.id === editingHikeId) return; // this hike is currently shown as the live editable route instead
-    const { group, line } = buildHikeLayerGroup(h.coordinates, h.id === activeHikeId ? "selected" : "default");
+
+  const visible = hikes.filter((h) => h.id !== editingHikeId);
+  const coordsById = distinctColorsEnabled ? computeOverlapOffsets(visible) : null;
+
+  visible.forEach((h) => {
+    const state = h.id === activeHikeId ? "selected" : "default";
+    const baseColor = distinctColorsEnabled ? colorForHikeId(h.id) : COLOR_DEFAULT;
+    const coords = coordsById ? coordsById[h.id] : h.coordinates;
+    const { group, line } = buildHikeLayerGroup(coords, state, baseColor);
     group.addTo(leafletMap);
     line.on("click", () => showDetail(h.id));
     line.bindTooltip(h.name);
     hikeLayers[h.id] = { group, line };
   });
+}
+
+// ---------- Distinct colors & metro-style overlap offset ----------
+const DISTINCT_COLORS = ["#2e7d32", "#2980b9", "#e67e22", "#8e44ad", "#16a085", "#d35400", "#c0392b", "#2c3e50", "#f39c12", "#7f8c8d"];
+
+function colorForHikeId(id) {
+  let hash = 0;
+  for (let i = 0; i < id.length; i++) hash = (hash * 31 + id.charCodeAt(i)) >>> 0;
+  return DISTINCT_COLORS[hash % DISTINCT_COLORS.length];
+}
+
+// Approximation, not true segment-level route bundling: wherever two hikes pass within
+// OFFSET_THRESHOLD_M of each other, nudge them apart perpendicular to their direction so they
+// read like parallel metro lines instead of one solid stack. Everywhere else, paths stay exact.
+function computeOverlapOffsets(hikeList) {
+  const OFFSET_THRESHOLD_M = 12;
+  const OFFSET_STEP_M = 4;
+  const marginDeg = OFFSET_THRESHOLD_M / 111320;
+
+  const boxes = hikeList.map((h) => boundsOf(h.coordinates));
+  const result = {};
+
+  hikeList.forEach((h, hi) => {
+    const nearby = [];
+    hikeList.forEach((other, oi) => {
+      if (oi === hi) return;
+      if (boxesOverlap(boxes[hi], boxes[oi], marginDeg)) nearby.push(other.coordinates);
+    });
+
+    if (nearby.length === 0) {
+      result[h.id] = h.coordinates;
+      return;
+    }
+
+    result[h.id] = h.coordinates.map(([lat, lng], i) => {
+      let coincidentCount = 0;
+      nearby.forEach((otherCoords) => {
+        if (otherCoords.some(([olat, olng]) => haversineMeters([lat, lng], [olat, olng]) < OFFSET_THRESHOLD_M)) {
+          coincidentCount++;
+        }
+      });
+      if (coincidentCount === 0) return [lat, lng];
+
+      // Stable per-hike rank (via id hash) so the same hike consistently offsets the same side.
+      const rank = ((colorForHikeIndex(h.id) % (coincidentCount + 1)) - coincidentCount / 2);
+      if (rank === 0) return [lat, lng];
+
+      const prev = h.coordinates[Math.max(0, i - 1)];
+      const next = h.coordinates[Math.min(h.coordinates.length - 1, i + 1)];
+      const dLat = next[0] - prev[0], dLng = next[1] - prev[1];
+      const len = Math.hypot(dLat, dLng) || 1;
+      const perpLat = -dLng / len, perpLng = dLat / len;
+      const offsetDeg = (rank * OFFSET_STEP_M) / 111320;
+      return [lat + perpLat * offsetDeg, lng + perpLng * offsetDeg];
+    });
+  });
+
+  return result;
+}
+
+function colorForHikeIndex(id) {
+  let hash = 0;
+  for (let i = 0; i < id.length; i++) hash = (hash * 31 + id.charCodeAt(i)) >>> 0;
+  return hash;
+}
+
+function boundsOf(coords) {
+  let minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
+  coords.forEach(([lat, lng]) => {
+    if (lat < minLat) minLat = lat;
+    if (lat > maxLat) maxLat = lat;
+    if (lng < minLng) minLng = lng;
+    if (lng > maxLng) maxLng = lng;
+  });
+  return { minLat, maxLat, minLng, maxLng };
+}
+
+function boxesOverlap(a, b, marginDeg) {
+  return !(
+    a.maxLat + marginDeg < b.minLat || b.maxLat + marginDeg < a.minLat ||
+    a.maxLng + marginDeg < b.minLng || b.maxLng + marginDeg < a.minLng
+  );
 }
 
 // ---------- Detail panel ----------
@@ -560,7 +756,10 @@ async function fetchOrsRoute(positions) {
     if (!feature) return null;
 
     const coords = feature.geometry.coordinates.map(([lng, lat]) => [lat, lng]);
-    const elevations = feature.geometry.coordinates.map((c) => c[2] ?? 0);
+    // ORS returns one elevation sample per vertex, which can sit only 1-2m apart on curves —
+    // at that spacing, tiny DEM rounding reads as a cliff. Smooth before using it for anything.
+    const rawElevations = feature.geometry.coordinates.map((c) => c[2] ?? 0);
+    const { smoothed: elevations } = computeGainLoss(rawElevations, 5);
     const props = feature.properties || {};
     const distanceKm = (props.summary && props.summary.distance != null ? props.summary.distance : pathDistanceKm(coords) * 1000) / 1000;
 
@@ -631,10 +830,13 @@ function pathDistanceKm(points) {
 
 function computeMaxSlopePct(coords, elevations) {
   if (!elevations || elevations.length < 2) return null;
+  // Below ~15m, normal DEM/GPS noise (a meter or two of elevation jitter) reads as a cliff —
+  // real trail grades need more horizontal run than that to be measured meaningfully.
+  const MIN_SEGMENT_M = 15;
   let max = 0;
   for (let i = 1; i < coords.length; i++) {
     const segM = haversineMeters(coords[i - 1], coords[i]);
-    if (segM < 3) continue;
+    if (segM < MIN_SEGMENT_M) continue;
     const slope = Math.abs((elevations[i] - elevations[i - 1]) / segM) * 100;
     if (slope > max) max = slope;
   }

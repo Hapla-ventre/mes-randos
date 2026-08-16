@@ -62,17 +62,22 @@ Le site se met à jour automatiquement en ~1 minute (GitHub Pages).
 ## Utilisation
 
 - **+ Nouvelle rando** → clique sur la carte pour poser des points A, B, C… L'itinéraire entre eux suit
-  automatiquement les sentiers (si la clé OpenRouteService est configurée).
-- **Glisse un point** pour le corriger — le tracé se recalcule tout seul autour de sa nouvelle position,
-  et peut ainsi "sauter" sur un autre chemin.
+  automatiquement les sentiers (si la clé OpenRouteService est configurée). Chaque point posé apparaît
+  aussi dans une liste sous la carte, avec un ✕ pour le supprimer individuellement.
+- **Glisse un point** (sur la carte ou via la poignée A/B/C…) pour le corriger — le tracé se recalcule
+  tout seul autour de sa nouvelle position. Tu peux aussi **cliquer-glisser directement sur le tracé**
+  entre deux points pour y insérer un nouveau point et le faire "sauter" sur un autre chemin.
 - **↩ Annuler point** retire le dernier point posé. **Terminer le tracé** fige distance, dénivelé, pente
   max et type de terrain.
 - Donne un nom, une date, des notes éventuelles, puis **Enregistrer**.
-- Sur la carte, une rando enregistrée est **rouge avec des flèches** indiquant le sens de parcours. En la
-  sélectionnant (liste ou clic sur la carte) elle passe en **rayures rouge/blanc** pour bien ressortir, et
-  tu peux voir ses stats, son profil d'altitude, la modifier ou la supprimer depuis le panneau qui s'ouvre.
+- Sur la carte, une rando enregistrée est **rouge avec des flèches noires à contour blanc** indiquant le
+  sens de parcours. En la sélectionnant (liste ou clic sur la carte) elle passe en **rayures rouge/blanc**
+  pour bien ressortir, et tu peux voir ses stats, son profil d'altitude, la modifier ou la supprimer.
 - **✎ Modifier cette rando** repasse en mode édition : la rando devient **bleue**, ses points redeviennent
   déplaçables/ajoutables comme à la création. Enregistrer met à jour la même rando (pas de doublon).
+- **Couleurs distinctes par rando** (case à cocher) : donne une couleur propre à chaque rando au lieu du
+  rouge uniforme. Les tronçons que deux randos partagent (à proximité l'une de l'autre) s'écartent
+  légèrement pour rester lisibles, un peu comme des lignes de métro qui se longent sans se superposer.
 - Le sélecteur de calques (haut à droite) propose un fond **Relief** avec courbes de niveau et estompage,
   en plus d'OpenStreetMap et IGN.
 
@@ -84,6 +89,9 @@ Le site se met à jour automatiquement en ~1 minute (GitHub Pages).
   données SRTM) — comme la plupart des applis de rando, l'estompage n'est pas recalculé à la volée dans le
   navigateur, ce serait beaucoup trop coûteux pour un rendu à la demande.
 - Fond de carte IGN disponible via le même sélecteur (plus lisible pour la rando en France).
+- L'écartement "métro" des randos superposées est une approximation par proximité de points (pas une vraie
+  détection de tronçons partagés comme le ferait un logiciel de plan de transport) — largement suffisant
+  pour distinguer tes randos, mais pas géométriquement parfait sur des croisements complexes.
 - Aucune donnée n'est envoyée ailleurs qu'à ton propre projet Firebase, à OpenRouteService (pour le calcul d'itinéraire)
   et à Open-Meteo (altitude, en secours, anonyme et sans clé).
 - Leaflet et le SDK Firebase sont embarqués localement dans `vendor/` (pas de dépendance à un CDN externe).
