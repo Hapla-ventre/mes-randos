@@ -308,6 +308,25 @@ button.danger:hover { background: var(--danger); color: white; }
 }
 .toggle-row input { width: 15px; height: 15px; cursor: pointer; }
 
+.sort-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--hint);
+  margin: 0 0 12px;
+}
+.sort-row select {
+  font-family: inherit;
+  font-size: 12.5px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  color: var(--text);
+  background: white;
+}
+
 @media (max-width: 700px) {
   .app { flex-direction: column; }
   .sidebar { width: 100%; min-width: 0; max-height: 45vh; border-right: none; border-bottom: 1px solid var(--border); }

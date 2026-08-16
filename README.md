@@ -85,16 +85,25 @@ Le site se met à jour automatiquement en ~1 minute (GitHub Pages).
   un peu comme des lignes de métro qui se longent sans se superposer.
 - Le sélecteur de calques (haut à droite) propose un fond **Relief** avec courbes de niveau et estompage,
   en plus d'OpenStreetMap et IGN.
+- La liste des randos (à gauche) peut être **triée par date, longueur ou dénivelé** via le menu au-dessus.
+- Si tes randos ont été enregistrées avant une correction du calcul de dénivelé, l'app **recalcule leurs
+  chiffres toute seule** à l'ouverture (tu verras un petit message le temps que ça tourne) — rien d'autre
+  n'est touché (tracé, nom, date, notes restent identiques).
 
 ## Notes techniques
 
 - Le type de terrain vient d'OpenRouteService quand le tracé est routé ; sans clé, ou si l'itinéraire est
   indisponible, l'app trace une ligne directe et calcule l'altitude via Open-Meteo (~90m de résolution).
-- Le dénivelé (D+/D-) est calculé par l'app elle-même avec un filtre à seuil (10m) sur l'altitude lissée,
-  pas en sommant brut chaque micro-variation — sinon le bruit des données d'altitude gonfle vite les
-  chiffres de plusieurs centaines de mètres sur une longue rando. Cette méthode est plus proche de celle
-  des applis de rando sérieuses (Strava, Outdooractive…), mais le seuil exact diffère d'un outil à l'autre,
-  donc un léger écart entre deux applis reste normal.
+- Le dénivelé (D+/D-) est calculé par l'app elle-même avec un filtre à seuil (10m), pas en sommant brut
+  chaque micro-variation — sinon le bruit des données d'altitude gonfle vite les chiffres de plusieurs
+  centaines de mètres sur une longue rando. Cette méthode est plus proche de celle des applis de rando
+  sérieuses (Strava, Outdooractive…), mais le seuil exact diffère d'un outil à l'autre, donc un léger
+  écart entre deux applis reste normal.
+- Deux lissages différents sont appliqués à la même altitude brute : un léger (5m) pour le calcul du
+  dénivelé (le filtre à seuil ci-dessus gère déjà le bruit, un lissage trop large ferait sous-estimer les
+  vraies petites variations de terrain), et un large (25m) pour le graphique de profil et la pente max
+  (les données d'altitude sont souvent "blocs" de plusieurs dizaines de mètres, ce qui donne un effet
+  d'escalier si le tracé est échantillonné plus finement que ça).
 - Le fond **Relief** utilise les tuiles pré-calculées d'OpenTopoMap (courbes de niveau + ombrage à partir de
   données SRTM) — comme la plupart des applis de rando, l'estompage n'est pas recalculé à la volée dans le
   navigateur, ce serait beaucoup trop coûteux pour un rendu à la demande.

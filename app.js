@@ -12,6 +12,7 @@ let hikeLayers = {};          // id -> { group, line }
 let activeHikeId = null;
 let isolateSelectedHike = false;
 let distinctColorsEnabled = localStorage.getItem("distinctColors") === "1";
+let sortMode = localStorage.getItem("sortMode") || "date";
 let overlapClustersCache = null;      // memoized coincidence detection, expensive part
 let overlapClustersForHikes = null;   // which `hikes` array + editing state the cache was built for
 let overlapClustersForEditingId = null;
@@ -59,16 +60,56 @@ async function doAuth(mode) {
   }
 }
 
-function onAuthed(user) {
+async function onAuthed(user) {
   if (user) {
     loginScreen.classList.add("hidden");
     appEl.classList.remove("hidden");
     initMapIfNeeded();
-    loadHikes();
+    await loadHikes();
+    migrateOutdatedElevations(); // runs in the background, doesn't block the UI
   } else {
     loginScreen.classList.remove("hidden");
     appEl.classList.add("hidden");
   }
+}
+
+// Bumped whenever the elevation/gain-loss/slope math changes in a way worth recomputing old
+// hikes for. Each hike stores the version it was last computed with; on login, any hike behind
+// this number gets its numbers refreshed automatically — nothing else about it is touched.
+const ELEVATION_SCHEMA_VERSION = 2;
+
+async function migrateOutdatedElevations() {
+  const outdated = hikes.filter((h) => h.elevationSchemaVersion < ELEVATION_SCHEMA_VERSION && h.coordinates.length > 1);
+  if (outdated.length === 0) return;
+
+  const statusEl = document.getElementById("migration-status");
+  let done = 0;
+  statusEl.textContent = `Recalcul du dénivelé de ${outdated.length} rando(s)…`;
+  statusEl.classList.remove("hidden");
+
+  for (const h of outdated) {
+    try {
+      const rawElevations = await fetchElevations(h.coordinates);
+      const { gainM, lossM, displayElevations, maxSlopePct } = deriveElevationStats(h.coordinates, rawElevations);
+      await db.collection("hikes").doc(h.id).update({
+        elevations: displayElevations,
+        elevationGainM: gainM,
+        elevationLossM: lossM,
+        maxSlopePct,
+        elevationSchemaVersion: ELEVATION_SCHEMA_VERSION,
+      });
+    } catch (err) {
+      console.error("Recalcul du dénivelé impossible pour cette rando, réessaiera plus tard", h.id, err);
+      // left un-stamped on purpose so it's retried next time the app loads, and nothing about
+      // the hike itself (coordinates, waypoints, name, notes…) was ever touched either way
+    }
+    done++;
+    statusEl.textContent = `Recalcul du dénivelé de tes randos… ${done}/${outdated.length}`;
+    await new Promise((resolve) => setTimeout(resolve, 400)); // be gentle with the free elevation API
+  }
+
+  statusEl.classList.add("hidden");
+  await loadHikes();
 }
 
 const chkDistinctColors = document.getElementById("chk-distinct-colors");
@@ -78,6 +119,14 @@ chkDistinctColors.addEventListener("change", () => {
   localStorage.setItem("distinctColors", distinctColorsEnabled ? "1" : "0");
   renderHikeList();
   renderHikeLayers();
+});
+
+const sortSelect = document.getElementById("sort-select");
+sortSelect.value = sortMode;
+sortSelect.addEventListener("change", () => {
+  sortMode = sortSelect.value;
+  localStorage.setItem("sortMode", sortMode);
+  renderHikeList();
 });
 
 // ---------- Map ----------
@@ -403,6 +452,7 @@ async function saveHike() {
     maxSlopePct: pendingStats.maxSlopePct,
     surfaceSummary: pendingStats.surfaceSummary,
     routed: pendingStats.routed,
+    elevationSchemaVersion: ELEVATION_SCHEMA_VERSION,
   };
 
   try {
@@ -455,11 +505,20 @@ async function loadHikes() {
         maxSlopePct: d.maxSlopePct != null ? d.maxSlopePct : null,
         surfaceSummary: d.surfaceSummary || null,
         routed: !!d.routed,
+        elevationSchemaVersion: d.elevationSchemaVersion || 1,
       };
     })
     .sort((a, b) => (b.date || "").localeCompare(a.date || ""));
   renderHikeList();
   renderHikeLayers();
+}
+
+function sortedHikes() {
+  const list = [...hikes];
+  if (sortMode === "distance") list.sort((a, b) => (b.distanceKm || 0) - (a.distanceKm || 0));
+  else if (sortMode === "gain") list.sort((a, b) => (b.elevationGainM || 0) - (a.elevationGainM || 0));
+  else list.sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+  return list;
 }
 
 function renderHikeList() {
@@ -469,7 +528,7 @@ function renderHikeList() {
     listEl.innerHTML = "<p class='empty-state'>Aucune rando pour l'instant.<br>Clique sur \"Nouvelle rando\" pour tracer la première.</p>";
     return;
   }
-  hikes.forEach((h) => {
+  sortedHikes().forEach((h) => {
     const isActive = h.id === activeHikeId;
     const el = document.createElement("div");
     el.className = "hike-item" + (isActive ? " active" : "");
@@ -584,6 +643,7 @@ function metersPerPixel(lat, zoom) {
 // normal and fine) — only ever separated from OTHER hikes.
 const OVERLAP_THRESHOLD_M = 20;
 const OVERLAP_SMOOTH_WINDOW = 8; // points of smoothing on the offset, so it ramps in/out instead of snapping side to side
+const OVERLAP_MIN_RUN_POINTS = 6; // a couple of trails merely crossing at an angle stay within threshold for only a point or two — require a genuinely sustained run before treating it as "the same path", so a brief crossing doesn't get separated needlessly
 
 // The expensive step: for every point of every hike, find which OTHER hikes have a point within
 // OVERLAP_THRESHOLD_M, via a spatial grid so this is roughly linear in the total point count
@@ -617,20 +677,52 @@ function buildOverlapClusters(hikeList) {
     return out;
   }
 
-  // Raw per-point rank first — this alone is jittery, since which other hikes happen to fall
-  // within the threshold can flip point-to-point by a meter or two of digitizing noise.
-  const rawRanks = {};
-  hikeList.forEach((h) => { rawRanks[h.id] = new Array(h.coordinates.length).fill(0); });
+  // Which other hikes are within threshold at each point — kept per-partner (not summed yet) so
+  // a minimum-run-length filter can be applied per pair before it affects the rank.
+  const coincidentSets = {};
+  hikeList.forEach((h) => { coincidentSets[h.id] = h.coordinates.map(() => new Set()); });
 
   hikeList.forEach((h) => {
     h.coordinates.forEach(([lat, lng], i) => {
-      const otherHikeIds = new Set();
       neighborsOf(lat, lng).forEach((q) => {
         if (q.hikeId === h.id) return;
-        if (haversineMeters([lat, lng], [q.lat, q.lng]) < OVERLAP_THRESHOLD_M) otherHikeIds.add(q.hikeId);
+        if (haversineMeters([lat, lng], [q.lat, q.lng]) < OVERLAP_THRESHOLD_M) coincidentSets[h.id][i].add(q.hikeId);
       });
-      if (otherHikeIds.size === 0) return;
+    });
+  });
 
+  // Drop any (hike, other hike) pairing that isn't sustained for at least OVERLAP_MIN_RUN_POINTS
+  // in a row — two trails merely crossing at an angle only satisfy the distance threshold for a
+  // point or two, which isn't "running together" and shouldn't trigger a separation.
+  const filteredSets = {};
+  hikeList.forEach((h) => {
+    const raw = coincidentSets[h.id];
+    const n = raw.length;
+    const filtered = raw.map(() => new Set());
+    const partners = new Set();
+    raw.forEach((s) => s.forEach((id) => partners.add(id)));
+    partners.forEach((otherId) => {
+      let runStart = -1;
+      for (let i = 0; i <= n; i++) {
+        const present = i < n && raw[i].has(otherId);
+        if (present && runStart === -1) runStart = i;
+        if (!present && runStart !== -1) {
+          if (i - runStart >= OVERLAP_MIN_RUN_POINTS) {
+            for (let j = runStart; j < i; j++) filtered[j].add(otherId);
+          }
+          runStart = -1;
+        }
+      }
+    });
+    filteredSets[h.id] = filtered;
+  });
+
+  // Raw per-point rank from the filtered sets — this alone is still a little jittery at the
+  // edges of a genuine overlap, hence the smoothing pass right after.
+  const rawRanks = {};
+  hikeList.forEach((h) => {
+    rawRanks[h.id] = filteredSets[h.id].map((otherHikeIds) => {
+      if (otherHikeIds.size === 0) return 0;
       // Fixed per-pair rule (id comparison), not "sort whoever's nearby right now": hike A is
       // always on the same side relative to hike B, everywhere the two of them meet, regardless
       // of which other hikes also happen to be nearby at this particular point. Ranking by the
@@ -639,7 +731,7 @@ function buildOverlapClusters(hikeList) {
       // the same side (no separation) or a hike's own line to fork as its neighbor set changed.
       let sum = 0;
       otherHikeIds.forEach((otherId) => { sum += h.id < otherId ? -1 : 1; });
-      rawRanks[h.id][i] = sum / 2;
+      return sum / 2;
     });
   });
 
@@ -872,23 +964,18 @@ async function fetchOrsRoute(positions) {
     if (!feature) return null;
 
     const coords = feature.geometry.coordinates.map(([lng, lat]) => [lat, lng]);
-    // ORS returns one elevation sample per vertex, which can sit only 1-2m apart on curves —
-    // at that spacing, tiny DEM rounding reads as a cliff. Smooth before using it for anything,
-    // and compute D+/D- ourselves (ORS's own ascent/descent sums every bit of that same DEM
-    // noise with no filtering, which is why it ran noticeably higher than other apps).
     const rawElevations = feature.geometry.coordinates.map((c) => c[2] ?? 0);
-    const elevations = smoothElevations(coords, rawElevations, 5);
-    const { gain, loss } = computeGainLossHysteresis(elevations);
+    const { gainM, lossM, displayElevations, maxSlopePct } = deriveElevationStats(coords, rawElevations);
     const props = feature.properties || {};
     const distanceKm = (props.summary && props.summary.distance != null ? props.summary.distance : pathDistanceKm(coords) * 1000) / 1000;
 
     return {
       coordinates: coords,
-      elevations,
+      elevations: displayElevations,
       distanceKm,
-      gainM: gain,
-      lossM: loss,
-      maxSlopePct: computeMaxSlopePct(coords, elevations),
+      gainM,
+      lossM,
+      maxSlopePct,
       surfaceSummary: summarizeWaytype(props.extras),
       routed: true,
     };
@@ -903,15 +990,14 @@ async function fallbackStraightRoute(positions) {
   try {
     const dense = densifyPath(positions, 30);
     const rawElevations = await fetchElevations(dense);
-    const elevations = smoothElevations(dense, rawElevations, 5);
-    const { gain, loss } = computeGainLossHysteresis(elevations);
+    const { gainM, lossM, displayElevations, maxSlopePct } = deriveElevationStats(dense, rawElevations);
     return {
       coordinates: dense,
-      elevations,
+      elevations: displayElevations,
       distanceKm,
-      gainM: gain,
-      lossM: loss,
-      maxSlopePct: computeMaxSlopePct(dense, elevations),
+      gainM,
+      lossM,
+      maxSlopePct,
       surfaceSummary: null,
       routed: false,
     };
@@ -951,13 +1037,22 @@ function pathDistanceKm(points) {
 function computeMaxSlopePct(coords, elevations) {
   if (!elevations || elevations.length < 2) return null;
   // Below ~15m, normal DEM/GPS noise (a meter or two of elevation jitter) reads as a cliff —
-  // real trail grades need more horizontal run than that to be measured meaningfully.
+  // real trail grades need more horizontal run than that to be measured meaningfully. Routed
+  // geometry is often much denser than that (points every 1-5m), so comparing only immediate
+  // neighbors would skip virtually every pair and silently report ~0% for real hikes — instead,
+  // slide a window forward from each point to the first one at least MIN_SEGMENT_M further along.
   const MIN_SEGMENT_M = 15;
+  const cumDist = [0];
+  for (let i = 1; i < coords.length; i++) cumDist.push(cumDist[i - 1] + haversineMeters(coords[i - 1], coords[i]));
+
   let max = 0;
-  for (let i = 1; i < coords.length; i++) {
-    const segM = haversineMeters(coords[i - 1], coords[i]);
+  let j = 0;
+  for (let i = 0; i < coords.length; i++) {
+    if (j < i + 1) j = i + 1;
+    while (j < coords.length - 1 && cumDist[j] - cumDist[i] < MIN_SEGMENT_M) j++;
+    const segM = cumDist[j] - cumDist[i];
     if (segM < MIN_SEGMENT_M) continue;
-    const slope = Math.abs((elevations[i] - elevations[i - 1]) / segM) * 100;
+    const slope = Math.abs((elevations[j] - elevations[i]) / segM) * 100;
     if (slope > max) max = slope;
   }
   return max;
@@ -992,6 +1087,28 @@ async function fetchElevations(points) {
     elevations.push(...json.elevation);
   }
   return elevations;
+}
+
+// Two different smoothing widths for two different jobs, from the same raw altitude samples:
+// - a LIGHT pass (5m) feeds the hysteresis gain/loss calculation, which is itself already noise-
+//   robust (it only counts a leg once it reverses by 10m) — smoothing it further than this just
+//   throws away genuine small climbs and under-counts D+/D-, which is what happened when a
+//   single wide window was used for both jobs.
+// - a WIDE pass (25m) feeds the elevation chart and the max-slope reading. Elevation datasets are
+//   often quantized to blocks tens of meters across (the source DEM's own resolution), which
+//   shows up as a "staircase" when sampled every 1-2m along a route — far too coarse for a 5m
+//   window to blend away, so the chart needs its own wider pass to look like a real profile
+//   instead of a flight of stairs.
+function deriveElevationStats(coords, rawElevations) {
+  const gainLossElevations = smoothElevations(coords, rawElevations, 5);
+  const { gain, loss } = computeGainLossHysteresis(gainLossElevations);
+  const displayElevations = smoothElevations(coords, rawElevations, 25);
+  return {
+    gainM: gain,
+    lossM: loss,
+    displayElevations,
+    maxSlopePct: computeMaxSlopePct(coords, displayElevations),
+  };
 }
 
 // Moving average over a fixed real-world distance rather than a fixed point count: routed

@@ -32,6 +32,7 @@
     </div>
 
     <button id="btn-new-hike" class="btn-primary">+ Nouvelle rando</button>
+    <p id="migration-status" class="hint hidden"></p>
 
     <div id="draw-panel" class="draw-panel hidden">
       <p id="draw-hint" class="hint">Clique sur la carte pour poser des points (A, B, C…) — l'itinéraire suit les sentiers entre eux. Glisse un point pour le corriger.</p>
@@ -60,6 +61,15 @@
     <label class="toggle-row">
       <input type="checkbox" id="chk-distinct-colors" />
       Couleurs distinctes par rando
+    </label>
+
+    <label class="sort-row">
+      Trier par
+      <select id="sort-select">
+        <option value="date">Date (récente d'abord)</option>
+        <option value="distance">Longueur (la + longue)</option>
+        <option value="gain">Dénivelé (le + élevé)</option>
+      </select>
     </label>
 
     <div id="hike-list" class="hike-list"></div>
