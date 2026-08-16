@@ -9,7 +9,7 @@ const COLOR_EDITING = "#2980b9";  // rando en cours de modification / création
 // Bumped by hand on every change, shown in the sidebar footer — GitHub Pages can take a minute to
 // actually serve a new push, and the browser can also just be showing a cached copy, so this is
 // the one reliable way to confirm you're testing the version you think you're testing.
-const APP_VERSION = "v16 · 2026-08-17";
+const APP_VERSION = "v17 · 2026-08-17";
 document.getElementById("app-version").textContent = APP_VERSION;
 
 let leafletMap;
@@ -722,14 +722,22 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
   }
 
   // Self-overlap: a hike meeting its own path again later (e.g. an out-and-back's return leg).
+  // Picks the NEAREST candidate within threshold, not just the first one the grid scan happens to
+  // turn up — with the return leg's points snapping onto whichever match they're assigned (see
+  // below), taking "first found" let the snap target jump between unrelated nearby points instead
+  // of tracking the genuinely closest one, which is what rendered as a jagged, self-crossing mess
+  // instead of a clean retrace of the outbound leg.
   const selfMatchIndex = {}; // hikeId -> per-point index it re-meets its own path at, or -1
   hikeList.forEach((h) => { selfMatchIndex[h.id] = new Array(h.coordinates.length).fill(-1); });
   hikeList.forEach((h) => {
     h.coordinates.forEach(([lat, lng], i) => {
+      let bestDist = Infinity;
       neighborsOf(lat, lng).forEach((q) => {
         if (q.hikeId !== h.id) return;
         if (Math.abs(q.i - i) < OVERLAP_MIN_SELF_INDEX_GAP) return;
-        if (selfMatchIndex[h.id][i] === -1 && haversineMeters([lat, lng], [q.lat, q.lng]) < OVERLAP_THRESHOLD_M) {
+        const d = haversineMeters([lat, lng], [q.lat, q.lng]);
+        if (d < OVERLAP_THRESHOLD_M && d < bestDist) {
+          bestDist = d;
           selfMatchIndex[h.id][i] = q.i;
         }
       });
@@ -737,6 +745,31 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
   });
   const filteredSelf = {};
   hikeList.forEach((h) => { filteredSelf[h.id] = filterRuns(h.coordinates.length, (i) => selfMatchIndex[h.id][i] !== -1); });
+
+  // The nearest-match choice can still drift a point or two off the "true" mirror index from one
+  // point to the next (the outbound and return legs aren't perfectly parallel), which is enough to
+  // make the snapped return leg visibly zigzag instead of smoothly retracing the outbound one.
+  // Since both legs are walked in a continuous, ordered fashion, the correspondence between them
+  // should also move smoothly — replace each match index with the median of a small window of its
+  // neighbors (only over points that are genuinely part of the same run) to iron out that jitter,
+  // the same principle as the elevation outlier rejection above.
+  const SELF_MATCH_SMOOTH_WINDOW = 4;
+  function smoothSelfMatch(filtered, matchIndex) {
+    const n = filtered.length;
+    const smoothed = matchIndex.slice();
+    for (let i = 0; i < n; i++) {
+      if (!filtered[i]) continue;
+      const windowVals = [];
+      for (let d = -SELF_MATCH_SMOOTH_WINDOW; d <= SELF_MATCH_SMOOTH_WINDOW; d++) {
+        const j = i + d;
+        if (j >= 0 && j < n && filtered[j]) windowVals.push(matchIndex[j]);
+      }
+      windowVals.sort((a, b) => a - b);
+      smoothed[i] = windowVals[Math.floor(windowVals.length / 2)];
+    }
+    for (let i = 0; i < n; i++) matchIndex[i] = smoothed[i];
+  }
+  hikeList.forEach((h) => { smoothSelfMatch(filteredSelf[h.id], selfMatchIndex[h.id]); });
 
   // An out-and-back's two legs are rarely pixel-identical the whole way (the routed geometry for
   // "there" and "back" can drift apart by a few extra meters here and there, e.g. around a
@@ -810,11 +843,31 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
   // A different hike overlapping the same spot is a genuinely different color worth distinguishing,
   // so that part keeps the small perpendicular nudge — computed completely independently of self,
   // so the two mechanisms can no longer interact or partially cancel each other.
+  //
+  // Each PAIR of hikes gets its own magnitude around 0.5 (derived from the pair's ids), instead of
+  // every pair using exactly the same 0.5 — with only two hikes overlapping that wouldn't matter,
+  // but at a busy junction where 3+ hikes converge, each hike's total is a sum of several ±(some
+  // partner's magnitude) terms, and if every pair used the identical 0.5 step, two DIFFERENT hikes
+  // could easily land on the exact same total (e.g. one hike touching 2 partners, another touching
+  // a different single partner, both summing to the same value) — one would render exactly on top
+  // of the other and disappear. Distinct per-pair magnitudes make that coincidence astronomically
+  // unlikely without giving up the gradual, per-partner-independent behavior that keeps this stable
+  // (unlike the ordinal-ranking attempt this replaced, which was collision-free but jumped around
+  // erratically as which hikes were nearby kept changing along the path).
+  function pairMagnitude(idA, idB) {
+    const key = idA < idB ? idA + "|" + idB : idB + "|" + idA;
+    let hash = 0;
+    for (let i = 0; i < key.length; i++) hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
+    return 0.4 + (hash % 21) / 100; // 0.40 .. 0.60
+  }
   const rawOtherRanks = {};
   hikeList.forEach((h) => {
     rawOtherRanks[h.id] = h.coordinates.map((_, i) => {
       let sum = 0;
-      filteredOtherSets[h.id][i].forEach((otherId) => { sum += (h.id < otherId ? -1 : 1) / 2; });
+      filteredOtherSets[h.id][i].forEach((otherId) => {
+        const mag = pairMagnitude(h.id, otherId);
+        sum += h.id < otherId ? -mag : mag;
+      });
       return sum;
     });
   });
