@@ -11,6 +11,9 @@ let hikes = [];               // loaded from Firestore
 let hikeLayers = {};          // id -> { group, line }
 let activeHikeId = null;
 let distinctColorsEnabled = localStorage.getItem("distinctColors") === "1";
+let overlapClustersCache = null;      // memoized coincidence detection, expensive part
+let overlapClustersForHikes = null;   // which `hikes` array + editing state the cache was built for
+let overlapClustersForEditingId = null;
 
 let drawing = false;
 let editingHikeId = null;     // id of the hike being modified, or null when creating a new one
@@ -295,11 +298,11 @@ document.getElementById("btn-cancel-save").addEventListener("click", () => {
 document.getElementById("btn-save-hike").addEventListener("click", saveHike);
 
 function startDrawing() {
-  closeDetail();
   editingHikeId = null;
   editingHikeData = null;
+  drawing = true; // set before closeDetail() so its renderHikeLayers() call hides everything else
+  closeDetail();
   resetDrawingState();
-  drawing = true;
   waypointLayer = L.layerGroup().addTo(leafletMap);
   document.getElementById("btn-new-hike").classList.add("hidden");
   document.getElementById("draw-hint").textContent =
@@ -310,13 +313,12 @@ function startDrawing() {
 }
 
 function startEditingHike(hike) {
-  closeDetail();
   editingHikeId = hike.id;
   editingHikeData = hike;
-  renderHikeLayers(); // rebuild without this hike's static layer — it's now the live editable one
+  drawing = true; // set before closeDetail() so its renderHikeLayers() call hides everything else
+  closeDetail();
 
   resetDrawingState();
-  drawing = true;
   waypointLayer = L.layerGroup().addTo(leafletMap);
   document.getElementById("btn-new-hike").classList.add("hidden");
   document.getElementById("draw-hint").textContent =
@@ -345,13 +347,12 @@ function resetDrawingState() {
 
 function cancelDrawing() {
   drawing = false;
-  const wasEditing = editingHikeId !== null;
   editingHikeId = null;
   editingHikeData = null;
   resetDrawingState();
   drawPanel.classList.add("hidden");
   document.getElementById("btn-new-hike").classList.remove("hidden");
-  if (wasEditing) renderHikeLayers(); // bring back the hike's static layer, unchanged
+  renderHikeLayers(); // bring every hike back now that nothing is being drawn/edited
 }
 
 async function finishDrawing() {
@@ -523,9 +524,23 @@ function buildHikeLayerGroup(coords, state, baseColor) {
 function renderHikeLayers() {
   Object.values(hikeLayers).forEach(({ group }) => leafletMap.removeLayer(group));
   hikeLayers = {};
+  if (drawing) return; // keep the map clear of every other hike while actively drawing/editing one
 
   const visible = hikes.filter((h) => h.id !== editingHikeId);
-  const coordsById = distinctColorsEnabled ? computeOverlapOffsets(visible) : null;
+
+  let coordsById = null;
+  if (distinctColorsEnabled) {
+    // The coincidence detection (which points sit on top of which) is the expensive part but
+    // doesn't depend on zoom at all — only the pixel→degrees conversion of the offset does. So
+    // it's cached here and only rebuilt when the hikes themselves change, while zooming just
+    // rescales the cached result — that's what keeps zoom/pan smooth with this mode on.
+    if (overlapClustersForHikes !== hikes || overlapClustersForEditingId !== editingHikeId) {
+      overlapClustersCache = buildOverlapClusters(visible);
+      overlapClustersForHikes = hikes;
+      overlapClustersForEditingId = editingHikeId;
+    }
+    coordsById = applyOverlapClusters(visible, overlapClustersCache, leafletMap.getZoom());
+  }
 
   visible.forEach((h) => {
     const state = h.id === activeHikeId ? "selected" : "default";
@@ -555,79 +570,93 @@ function metersPerPixel(lat, zoom) {
   return (156543.03392 * Math.cos((lat * Math.PI) / 180)) / Math.pow(2, zoom);
 }
 
-// Approximation, not true segment-level route bundling: wherever two hikes pass within
-// OFFSET_THRESHOLD_M of each other in reality, nudge them apart perpendicular to their
-// direction so they read like parallel metro lines instead of one solid stack. Everywhere
-// else, paths stay exact. The "are they close" check is a fixed real-world distance (generous,
-// since two independently-drawn/routed digitizations of "the same trail" can easily land
-// 15-20m apart); the visual gap itself is computed in pixels so it holds steady as the map
-// is zoomed, and sized to clear the line's full rendered width (halo included).
-function computeOverlapOffsets(hikeList) {
-  const OFFSET_THRESHOLD_M = 20;
-  const OFFSET_PIXELS = 8;
-  const marginDeg = OFFSET_THRESHOLD_M / 111320;
-  const zoom = leafletMap.getZoom();
+// Approximation, not true segment-level route bundling: wherever paths pass within
+// OVERLAP_THRESHOLD_M of each other in reality — whether that's two different hikes, three or
+// more sharing the same stretch, or a single hike crossing its own earlier track on an
+// out-and-back — nudge every one of them apart perpendicular to the direction of travel so they
+// read like parallel metro lines instead of one solid stack. Everywhere else, paths stay exact.
+const OVERLAP_THRESHOLD_M = 20;
+const OVERLAP_MIN_SELF_INDEX_GAP = 15; // how many points apart on the SAME hike before two nearby points count as a genuine second pass rather than just neighboring points on the same pass
 
-  const boxes = hikeList.map((h) => boundsOf(h.coordinates));
-  const result = {};
+// The expensive step: for every point of every hike, find which other points (any hike,
+// including a later point of the same hike) sit within OVERLAP_THRESHOLD_M, via a spatial grid
+// so this is roughly linear in the total point count instead of comparing every pair. Doesn't
+// depend on zoom, so it's cached by the caller and only rebuilt when the hikes actually change.
+function buildOverlapClusters(hikeList) {
+  const cellIndex = new Map();
+  const cellSizeDeg = OVERLAP_THRESHOLD_M / 111320;
 
-  hikeList.forEach((h, hi) => {
-    const nearby = [];
-    hikeList.forEach((other, oi) => {
-      if (oi === hi) return;
-      if (boxesOverlap(boxes[hi], boxes[oi], marginDeg)) nearby.push(other);
+  function cellKey(lat, lng) {
+    return Math.floor(lat / cellSizeDeg) + "_" + Math.floor(lng / cellSizeDeg);
+  }
+
+  hikeList.forEach((h) => {
+    h.coordinates.forEach(([lat, lng], i) => {
+      const key = cellKey(lat, lng);
+      if (!cellIndex.has(key)) cellIndex.set(key, []);
+      cellIndex.get(key).push({ hikeId: h.id, i, lat, lng });
     });
+  });
 
-    if (nearby.length === 0) {
-      result[h.id] = h.coordinates;
-      return;
+  function neighborsOf(lat, lng) {
+    const cy = Math.floor(lat / cellSizeDeg), cx = Math.floor(lng / cellSizeDeg);
+    const out = [];
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const bucket = cellIndex.get((cy + dy) + "_" + (cx + dx));
+        if (bucket) out.push(...bucket);
+      }
     }
+    return out;
+  }
 
-    result[h.id] = h.coordinates.map(([lat, lng], i) => {
-      // Every hike coincident at this exact spot, sorted the same deterministic way (by id) no
-      // matter which of them is doing the computing — that's what guarantees two overlapping
-      // hikes always land on DIFFERENT sides instead of a coin-flip chance of picking the same one.
-      const coincidentIds = [h.id];
-      nearby.forEach((other) => {
-        if (other.coordinates.some(([olat, olng]) => haversineMeters([lat, lng], [olat, olng]) < OFFSET_THRESHOLD_M)) {
-          coincidentIds.push(other.id);
-        }
+  const clusters = {}; // hikeId -> array (same length as coordinates) of {rank, perpLat, perpLng} | null
+  hikeList.forEach((h) => { clusters[h.id] = new Array(h.coordinates.length).fill(null); });
+
+  hikeList.forEach((h) => {
+    h.coordinates.forEach(([lat, lng], i) => {
+      const candidates = neighborsOf(lat, lng).filter((q) => {
+        if (q.hikeId === h.id && q.i === i) return false;
+        if (q.hikeId === h.id && Math.abs(q.i - i) < OVERLAP_MIN_SELF_INDEX_GAP) return false;
+        return haversineMeters([lat, lng], [q.lat, q.lng]) < OVERLAP_THRESHOLD_M;
       });
-      if (coincidentIds.length <= 1) return [lat, lng];
-      coincidentIds.sort();
-      const rank = coincidentIds.indexOf(h.id) - (coincidentIds.length - 1) / 2;
-      if (rank === 0) return [lat, lng];
+      if (candidates.length === 0) return;
 
-      const prev = h.coordinates[Math.max(0, i - 1)];
-      const next = h.coordinates[Math.min(h.coordinates.length - 1, i + 1)];
+      // Stable order across every occurrence found here (by hike id, then by point index for two
+      // passes of the SAME hike) — whoever else looks at this same spot sees the same ordering,
+      // so ranks never collide no matter how many paths converge here.
+      const occurrences = [{ hikeId: h.id, i }, ...candidates.map((c) => ({ hikeId: c.hikeId, i: c.i }))];
+      occurrences.sort((a, b) => (a.hikeId !== b.hikeId ? (a.hikeId < b.hikeId ? -1 : 1) : a.i - b.i));
+      const rank = occurrences.findIndex((o) => o.hikeId === h.id && o.i === i) - (occurrences.length - 1) / 2;
+      if (rank === 0) return;
+
+      const coords = h.coordinates;
+      const prev = coords[Math.max(0, i - 1)];
+      const next = coords[Math.min(coords.length - 1, i + 1)];
       const dLat = next[0] - prev[0], dLng = next[1] - prev[1];
       const len = Math.hypot(dLat, dLng) || 1;
-      const perpLat = -dLng / len, perpLng = dLat / len;
-      const offsetStepM = OFFSET_PIXELS * metersPerPixel(lat, zoom);
-      const offsetDeg = (rank * offsetStepM) / 111320;
-      return [lat + perpLat * offsetDeg, lng + perpLng * offsetDeg];
+      clusters[h.id][i] = { rank, perpLat: -dLng / len, perpLng: dLat / len };
     });
   });
 
-  return result;
+  return clusters;
 }
 
-function boundsOf(coords) {
-  let minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
-  coords.forEach(([lat, lng]) => {
-    if (lat < minLat) minLat = lat;
-    if (lat > maxLat) maxLat = lat;
-    if (lng < minLng) minLng = lng;
-    if (lng > maxLng) maxLng = lng;
+// The cheap step: turn the cached per-point rank into an actual coordinate offset for the
+// current zoom. Safe (and fast) to call on every zoomend.
+function applyOverlapClusters(hikeList, clusters, zoom) {
+  const result = {};
+  hikeList.forEach((h) => {
+    const clusterInfo = clusters[h.id];
+    result[h.id] = h.coordinates.map(([lat, lng], i) => {
+      const info = clusterInfo && clusterInfo[i];
+      if (!info) return [lat, lng];
+      const offsetStepM = 8 * metersPerPixel(lat, zoom); // 8px gap, enough to clear the halo'd line width
+      const offsetDeg = (info.rank * offsetStepM) / 111320;
+      return [lat + info.perpLat * offsetDeg, lng + info.perpLng * offsetDeg];
+    });
   });
-  return { minLat, maxLat, minLng, maxLng };
-}
-
-function boxesOverlap(a, b, marginDeg) {
-  return !(
-    a.maxLat + marginDeg < b.minLat || b.maxLat + marginDeg < a.minLat ||
-    a.maxLng + marginDeg < b.minLng || b.maxLng + marginDeg < a.minLng
-  );
+  return result;
 }
 
 // ---------- Detail panel ----------

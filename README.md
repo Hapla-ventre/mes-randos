@@ -76,10 +76,12 @@ Le site se met à jour automatiquement en ~1 minute (GitHub Pages).
 - Dans le panneau d'une rando, le **nom et la date sont modifiables directement** — change-les puis clique
   **💾 Enregistrer nom / date / notes** (ça ne touche pas au tracé, donc ni recalcul ni doublon).
 - **✎ Modifier le tracé** repasse en mode édition des points : la rando devient **bleue**, ses points
-  redeviennent déplaçables/ajoutables comme à la création. Enregistrer met à jour la même rando.
+  redeviennent déplaçables/ajoutables comme à la création, et toutes les autres randos disparaissent le
+  temps de l'édition pour ne pas gêner. Enregistrer met à jour la même rando.
 - **Couleurs distinctes par rando** (case à cocher) : donne une couleur propre à chaque rando au lieu du
-  rouge uniforme. Les tronçons que deux randos partagent (à proximité l'une de l'autre) s'écartent
-  légèrement pour rester lisibles, un peu comme des lignes de métro qui se longent sans se superposer.
+  rouge uniforme. Les tronçons partagés par plusieurs randos (ou repassés deux fois sur la même, genre
+  aller-retour) s'écartent légèrement pour rester lisibles, un peu comme des lignes de métro qui se
+  longent sans se superposer.
 - Le sélecteur de calques (haut à droite) propose un fond **Relief** avec courbes de niveau et estompage,
   en plus d'OpenStreetMap et IGN.
 
