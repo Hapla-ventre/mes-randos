@@ -8,5 +8,5 @@ window.APP_CONFIG = {
 
   // Clé gratuite openrouteservice.org (Dashboard > Request a token) — sert à faire suivre
   // les sentiers au tracé. Sans elle, l'app trace une ligne directe entre les points.
-  ORS_API_KEY: "",
+  ORS_API_KEY: "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6Ijg5OGIzM2FhYjgzMDQyYTQ5MDQzN2FmOGYyMjcxMTkzIiwiaCI6Im11cm11cjY0In0=",
 };
