@@ -77,7 +77,7 @@ async function onAuthed(user) {
 // Bumped whenever the elevation/gain-loss/slope math changes in a way worth recomputing old
 // hikes for. Each hike stores the version it was last computed with; on login, any hike behind
 // this number gets its numbers refreshed automatically — nothing else about it is touched.
-const ELEVATION_SCHEMA_VERSION = 3;
+const ELEVATION_SCHEMA_VERSION = 4;
 
 async function migrateOutdatedElevations() {
   const outdated = hikes.filter((h) => h.elevationSchemaVersion < ELEVATION_SCHEMA_VERSION && h.coordinates.length > 1);
@@ -1060,14 +1060,14 @@ function pathDistanceKm(points) {
 
 function computeMaxSlopePct(coords, elevations) {
   if (!elevations || elevations.length < 2) return null;
-  // Matches the wide (25m) elevation smoothing: measuring slope over a span shorter than the
-  // smoothing window mostly just re-measures the smoothing kernel's own edge behavior, not real
-  // terrain, which is how a handful of hikes ended up with an absurd "177%" reading despite the
-  // display elevation already being smoothed. Routed geometry is often much denser than that
-  // (points every 1-5m), so comparing only immediate neighbors would also skip virtually every
+  // Wider than the 25m elevation smoothing itself: a single leftover artifact in the smoothed
+  // curve (still possible even after outlier rejection) only spans a short stretch, so requiring
+  // the steep reading to hold up over a longer run makes an isolated glitch much less likely to
+  // produce a headline number like "177%". Routed geometry is often much denser than 50m between
+  // points (every 1-5m), so comparing only immediate neighbors would also skip virtually every
   // pair and silently report ~0% — instead, slide a window forward from each point to the first
   // one at least MIN_SEGMENT_M further along.
-  const MIN_SEGMENT_M = 25;
+  const MIN_SEGMENT_M = 50;
   const cumDist = [0];
   for (let i = 1; i < coords.length; i++) cumDist.push(cumDist[i - 1] + haversineMeters(coords[i - 1], coords[i]));
 
@@ -1107,12 +1107,23 @@ async function fetchElevations(points) {
     const chunk = points.slice(i, i + chunkSize);
     const lats = chunk.map((p) => p[0]).join(",");
     const lons = chunk.map((p) => p[1]).join(",");
-    const res = await fetch(`https://api.open-meteo.com/v1/elevation?latitude=${lats}&longitude=${lons}`);
-    if (!res.ok) throw new Error("Elevation API error");
-    const json = await res.json();
-    elevations.push(...json.elevation);
+    elevations.push(...(await fetchElevationChunkWithRetry(lats, lons)));
   }
   return elevations;
+}
+
+// Open-Meteo's free tier rate-limits fairly aggressively (seen firsthand while building this) —
+// a 429 here isn't a real failure, just "try again shortly". Worth a couple of retries before
+// giving up, especially since this is what silently left some hikes un-recalculated when the
+// batch migration ran through many of them back to back.
+async function fetchElevationChunkWithRetry(lats, lons, attempt = 0) {
+  const res = await fetch(`https://api.open-meteo.com/v1/elevation?latitude=${lats}&longitude=${lons}`);
+  if (res.ok) return (await res.json()).elevation;
+  if (res.status === 429 && attempt < 3) {
+    await new Promise((resolve) => setTimeout(resolve, 1500 * (attempt + 1)));
+    return fetchElevationChunkWithRetry(lats, lons, attempt + 1);
+  }
+  throw new Error("Elevation API error");
 }
 
 // A single bad altitude sample (a DEM void or glitch — happens occasionally, especially near
