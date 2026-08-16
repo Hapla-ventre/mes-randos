@@ -3,7 +3,10 @@ firebase.initializeApp(window.APP_CONFIG);
 const auth = firebase.auth();
 const db = firebase.firestore();
 
-const COLORS = ["#2e7d32", "#c0392b", "#2980b9", "#e67e22", "#8e44ad", "#16a085", "#d35400", "#2c3e50"];
+const HIKE_STYLE_DEFAULT = { color: "#7d8f7d", weight: 3, opacity: 0.55 };
+const HIKE_STYLE_SELECTED = { color: "#c0392b", weight: 5, opacity: 0.95 };
+const HIKE_STYLE_DIMMED = { color: "#7d8f7d", weight: 3, opacity: 0.2 };
+const DRAW_COLOR = "#c0392b";
 
 let leafletMap;
 let hikes = [];               // loaded from Firestore
@@ -11,10 +14,13 @@ let hikeLayers = {};          // id -> leaflet polyline
 let activeHikeId = null;
 
 let drawing = false;
-let drawPoints = [];          // [[lat, lng], ...]
-let drawLayer = null;
-let drawMarkersLayer = null;
-let pendingStats = null;
+let waypointMarkers = [];     // draggable L.marker[], in click order (A, B, C…)
+let waypointLayer = null;     // layer group holding the markers
+let routeLayer = null;        // visible polyline for the route currently being drawn
+let routeResult = null;       // { coordinates, elevations, distanceKm, gainM, lossM, maxSlopePct, surfaceSummary, routed }
+let rerouteTimer = null;
+let rerouteToken = 0;
+let pendingStats = null;      // routeResult snapshot handed to the save panel
 
 // ---------- Auth ----------
 const loginScreen = document.getElementById("login-screen");
@@ -81,22 +87,65 @@ function initMapIfNeeded() {
 
 function onMapClick(e) {
   if (!drawing) return;
-  drawPoints.push([e.latlng.lat, e.latlng.lng]);
-  redrawDrawLayer();
+  addWaypoint(e.latlng);
 }
 
-function redrawDrawLayer() {
-  if (drawLayer) leafletMap.removeLayer(drawLayer);
-  if (drawMarkersLayer) leafletMap.removeLayer(drawMarkersLayer);
+// ---------- Waypoints (draggable A, B, C…) ----------
+function waypointLabel(index) {
+  return index < 26 ? String.fromCharCode(65 + index) : String(index + 1);
+}
 
-  drawLayer = L.polyline(drawPoints, { color: "#c0392b", weight: 4 }).addTo(leafletMap);
-  drawMarkersLayer = L.layerGroup(
-    drawPoints.map((p) => L.circleMarker(p, { radius: 4, color: "#c0392b", fillColor: "#c0392b", fillOpacity: 1 }))
-  ).addTo(leafletMap);
+function createWaypointMarker(latlng, index) {
+  const icon = L.divIcon({
+    className: "",
+    html: `<div class="waypoint-icon"><span>${waypointLabel(index)}</span></div>`,
+    iconSize: [26, 26],
+    iconAnchor: [13, 26],
+  });
+  const marker = L.marker(latlng, { icon, draggable: true }).addTo(waypointLayer);
+  marker.on("dragend", scheduleReroute);
+  return marker;
+}
 
-  const dist = pathDistanceKm(drawPoints);
-  document.getElementById("draw-stats").textContent =
-    drawPoints.length > 1 ? `${drawPoints.length} points · ${dist.toFixed(2)} km (approx.)` : `${drawPoints.length} point`;
+function addWaypoint(latlng) {
+  const marker = createWaypointMarker(latlng, waypointMarkers.length);
+  waypointMarkers.push(marker);
+  renderDrawStats(waypointMarkers.length, "computing");
+  scheduleReroute();
+}
+
+function currentWaypointPositions() {
+  return waypointMarkers.map((m) => {
+    const ll = m.getLatLng();
+    return [ll.lat, ll.lng];
+  });
+}
+
+function scheduleReroute() {
+  clearTimeout(rerouteTimer);
+  rerouteTimer = setTimeout(rebuildRoute, 350);
+}
+
+async function rebuildRoute() {
+  const positions = currentWaypointPositions();
+
+  if (positions.length < 2) {
+    routeResult = null;
+    if (routeLayer) { leafletMap.removeLayer(routeLayer); routeLayer = null; }
+    renderDrawStats(positions.length);
+    return;
+  }
+
+  renderDrawStats(positions.length, "computing");
+  const token = ++rerouteToken;
+  let result = await fetchOrsRoute(positions);
+  if (!result) result = await fallbackStraightRoute(positions);
+  if (token !== rerouteToken) return; // a newer reroute superseded this one
+
+  routeResult = result;
+  if (routeLayer) leafletMap.removeLayer(routeLayer);
+  routeLayer = L.polyline(result.coordinates, { color: DRAW_COLOR, weight: 4, opacity: 0.9 }).addTo(leafletMap);
+  renderDrawStats(positions.length);
 }
 
 // ---------- Draw hike flow ----------
@@ -106,8 +155,10 @@ const savePanel = document.getElementById("save-panel");
 document.getElementById("btn-new-hike").addEventListener("click", startDrawing);
 document.getElementById("btn-cancel-draw").addEventListener("click", cancelDrawing);
 document.getElementById("btn-undo-point").addEventListener("click", () => {
-  drawPoints.pop();
-  redrawDrawLayer();
+  const marker = waypointMarkers.pop();
+  if (marker && waypointLayer) waypointLayer.removeLayer(marker);
+  renderDrawStats(waypointMarkers.length, "computing");
+  scheduleReroute();
 });
 document.getElementById("btn-finish-draw").addEventListener("click", finishDrawing);
 document.getElementById("btn-cancel-save").addEventListener("click", () => {
@@ -118,62 +169,69 @@ document.getElementById("btn-save-hike").addEventListener("click", saveHike);
 
 function startDrawing() {
   closeDetail();
+  resetDrawingState();
   drawing = true;
-  drawPoints = [];
+  waypointLayer = L.layerGroup().addTo(leafletMap);
   document.getElementById("btn-new-hike").classList.add("hidden");
   drawPanel.classList.remove("hidden");
-  document.getElementById("draw-stats").textContent = "0 point";
+  renderDrawStats(0);
+}
+
+function resetDrawingState() {
+  clearTimeout(rerouteTimer);
+  waypointMarkers = [];
+  if (waypointLayer) { leafletMap.removeLayer(waypointLayer); waypointLayer = null; }
+  if (routeLayer) { leafletMap.removeLayer(routeLayer); routeLayer = null; }
+  routeResult = null;
 }
 
 function cancelDrawing() {
   drawing = false;
-  drawPoints = [];
-  if (drawLayer) { leafletMap.removeLayer(drawLayer); drawLayer = null; }
-  if (drawMarkersLayer) { leafletMap.removeLayer(drawMarkersLayer); drawMarkersLayer = null; }
+  resetDrawingState();
   drawPanel.classList.add("hidden");
   document.getElementById("btn-new-hike").classList.remove("hidden");
 }
 
 async function finishDrawing() {
-  if (drawPoints.length < 2) {
+  const positions = currentWaypointPositions();
+  if (positions.length < 2) {
     alert("Place au moins deux points.");
     return;
   }
   drawing = false;
-  drawPanel.classList.add("hidden");
-  document.getElementById("draw-stats").textContent = "Calcul du dénivelé...";
-  drawPanel.classList.remove("hidden"); // keep visible with loading text briefly
-  drawPanel.classList.add("hidden");
+  clearTimeout(rerouteTimer);
+  renderDrawStats(positions.length, "computing");
+  await rebuildRoute(); // make sure routeResult reflects the final, possibly just-dragged, positions
 
+  drawPanel.classList.add("hidden");
   savePanel.classList.remove("hidden");
-  document.getElementById("hike-stats-preview").innerHTML = "<span class='hint'>Calcul du dénivelé en cours…</span>";
   document.getElementById("hike-date").valueAsDate = new Date();
 
-  try {
-    pendingStats = await computeStats(drawPoints);
-    renderStatsPreview("hike-stats-preview", pendingStats);
-  } catch (err) {
-    document.getElementById("hike-stats-preview").innerHTML =
-      "<span class='hint'>Dénivelé indisponible (API altitude injoignable). Distance seule utilisée.</span>";
-    pendingStats = { distanceKm: pathDistanceKm(drawPoints), gainM: null, lossM: null, elevations: null };
-  }
+  pendingStats = routeResult;
+  renderStatsPreview("hike-stats-preview", { distanceKm: pendingStats.distanceKm, gainM: pendingStats.gainM, lossM: pendingStats.lossM });
+  renderExtraInfo("hike-extra-info", pendingStats);
 }
 
 async function saveHike() {
   const name = document.getElementById("hike-name").value.trim() || "Rando sans nom";
   const date = document.getElementById("hike-date").value || null;
   const notes = document.getElementById("hike-notes").value.trim();
+  const positions = currentWaypointPositions();
 
   const payload = {
     userId: auth.currentUser.uid,
     name,
     date,
     notes,
-    coordinates: drawPoints.map(([lat, lng]) => ({ lat, lng })),
+    waypoints: positions.map(([lat, lng]) => ({ lat, lng })),
+    coordinates: pendingStats.coordinates.map(([lat, lng]) => ({ lat, lng })),
+    elevations: pendingStats.elevations,
     distanceKm: pendingStats.distanceKm,
     elevationGainM: pendingStats.gainM,
     elevationLossM: pendingStats.lossM,
-    elevations: pendingStats.elevations,
+    maxSlopePct: pendingStats.maxSlopePct,
+    surfaceSummary: pendingStats.surfaceSummary,
+    routed: pendingStats.routed,
     createdAt: firebase.firestore.FieldValue.serverTimestamp(),
   };
 
@@ -188,9 +246,7 @@ async function saveHike() {
   document.getElementById("hike-notes").value = "";
   savePanel.classList.add("hidden");
   document.getElementById("btn-new-hike").classList.remove("hidden");
-  drawPoints = [];
-  if (drawLayer) { leafletMap.removeLayer(drawLayer); drawLayer = null; }
-  if (drawMarkersLayer) { leafletMap.removeLayer(drawMarkersLayer); drawMarkersLayer = null; }
+  resetDrawingState();
 
   await loadHikes();
 }
@@ -212,11 +268,15 @@ async function loadHikes() {
         name: d.name,
         date: d.date,
         notes: d.notes,
+        waypoints: (d.waypoints || []).map((c) => [c.lat, c.lng]),
         coordinates: d.coordinates.map((c) => [c.lat, c.lng]),
         distanceKm: d.distanceKm,
         elevationGainM: d.elevationGainM,
         elevationLossM: d.elevationLossM,
         elevations: d.elevations,
+        maxSlopePct: d.maxSlopePct != null ? d.maxSlopePct : null,
+        surfaceSummary: d.surfaceSummary || null,
+        routed: !!d.routed,
       };
     })
     .sort((a, b) => (b.date || "").localeCompare(a.date || ""));
@@ -231,12 +291,12 @@ function renderHikeList() {
     listEl.innerHTML = "<p class='empty-state'>Aucune rando pour l'instant.<br>Clique sur \"Nouvelle rando\" pour tracer la première.</p>";
     return;
   }
-  hikes.forEach((h, i) => {
-    const color = COLORS[i % COLORS.length];
+  hikes.forEach((h) => {
+    const isActive = h.id === activeHikeId;
     const el = document.createElement("div");
-    el.className = "hike-item" + (h.id === activeHikeId ? " active" : "");
+    el.className = "hike-item" + (isActive ? " active" : "");
     el.innerHTML = `
-      <div class="name"><span class="swatch" style="background:${color}"></span>${escapeHtml(h.name)}</div>
+      <div class="name"><span class="swatch" style="background:${isActive ? HIKE_STYLE_SELECTED.color : HIKE_STYLE_DEFAULT.color}"></span>${escapeHtml(h.name)}</div>
       <div class="meta">${h.date ? formatDate(h.date) : "Sans date"} · ${h.distanceKm != null ? h.distanceKm.toFixed(1) + " km" : ""}${h.elevationGainM != null ? " · D+ " + Math.round(h.elevationGainM) + " m" : ""}</div>
     `;
     el.addEventListener("click", () => showDetail(h.id));
@@ -247,13 +307,23 @@ function renderHikeList() {
 function renderHikeLayers() {
   Object.values(hikeLayers).forEach((l) => leafletMap.removeLayer(l));
   hikeLayers = {};
-  hikes.forEach((h, i) => {
-    const color = COLORS[i % COLORS.length];
-    const line = L.polyline(h.coordinates, { color, weight: 4, opacity: 0.85 })
+  hikes.forEach((h) => {
+    const line = L.polyline(h.coordinates, HIKE_STYLE_DEFAULT)
       .addTo(leafletMap)
       .on("click", () => showDetail(h.id));
     line.bindTooltip(h.name);
     hikeLayers[h.id] = line;
+  });
+}
+
+function applyHikeStyles(selectedId) {
+  Object.entries(hikeLayers).forEach(([id, line]) => {
+    if (!selectedId) {
+      line.setStyle(HIKE_STYLE_DEFAULT);
+      return;
+    }
+    line.setStyle(id === selectedId ? HIKE_STYLE_SELECTED : HIKE_STYLE_DIMMED);
+    if (id === selectedId) line.bringToFront();
   });
 }
 
@@ -275,9 +345,11 @@ function showDetail(id) {
     gainM: h.elevationGainM,
     lossM: h.elevationLossM,
   });
+  renderExtraInfo("detail-extra-info", h);
   drawElevationProfile(h.elevations);
   detailPanel.classList.remove("hidden");
 
+  applyHikeStyles(id);
   const line = hikeLayers[id];
   if (line) leafletMap.fitBounds(line.getBounds(), { padding: [40, 40] });
 }
@@ -287,6 +359,7 @@ function closeDetail() {
   activeHikeId = null;
   detailPanel.classList.add("hidden");
   renderHikeList();
+  applyHikeStyles(null);
 }
 
 document.getElementById("btn-delete-hike").addEventListener("click", async () => {
@@ -309,6 +382,40 @@ function renderStatsPreview(elId, stats) {
     <div class="stat"><b>${stats.gainM != null ? "+" + Math.round(stats.gainM) : "–"}</b>D+ (m)</div>
     <div class="stat"><b>${stats.lossM != null ? "-" + Math.round(stats.lossM) : "–"}</b>D- (m)</div>
   `;
+}
+
+function renderExtraInfo(elId, result) {
+  const el = document.getElementById(elId);
+  if (!result) { el.textContent = ""; return; }
+  const bits = [];
+  if (result.maxSlopePct != null) bits.push(`Pente max ${result.maxSlopePct.toFixed(0)} %`);
+  if (result.surfaceSummary) bits.push(result.surfaceSummary);
+  if (result.routed === false) bits.push("Ligne directe — itinéraire indisponible");
+  el.textContent = bits.join(" · ");
+}
+
+function renderDrawStats(count, state) {
+  const statsEl = document.getElementById("draw-stats");
+  const extraEl = document.getElementById("draw-extra-info");
+
+  if (count < 2) {
+    statsEl.textContent = count === 0 ? "0 point" : "1 point";
+    extraEl.textContent = "";
+    return;
+  }
+  if (state === "computing") {
+    statsEl.textContent = `${count} points · calcul de l'itinéraire…`;
+    return;
+  }
+  if (!routeResult) {
+    statsEl.textContent = `${count} points`;
+    extraEl.textContent = "";
+    return;
+  }
+  const r = routeResult;
+  statsEl.innerHTML = `${count} points · ${r.distanceKm.toFixed(2)} km` +
+    (r.gainM != null ? ` · D+ ${Math.round(r.gainM)} m · D- ${Math.round(r.lossM)} m` : "");
+  renderExtraInfo("draw-extra-info", r);
 }
 
 function drawElevationProfile(elevations) {
@@ -338,6 +445,94 @@ function drawElevationProfile(elevations) {
   ctx.fill();
 }
 
+// ---------- Routing (OpenRouteService, foot-hiking) ----------
+const WAYTYPE_LABELS = {
+  0: "Terrain mixte", 1: "Route nationale", 2: "Route", 3: "Rue", 4: "Chemin",
+  5: "Piste", 6: "Voie cyclable", 7: "Sentier", 8: "Escaliers", 9: "Bac", 10: "Chantier",
+};
+
+function summarizeWaytype(extras) {
+  const wt = extras && extras.waytype;
+  if (!wt || !wt.summary || !wt.summary.length) return null;
+  const sorted = [...wt.summary].sort((a, b) => b.amount - a.amount);
+  const top = sorted[0];
+  const label = WAYTYPE_LABELS[top.value] || "Terrain mixte";
+  const pct = Math.round(top.amount);
+  if (sorted.length === 1 || pct >= 85) return `Principalement ${label.toLowerCase()}`;
+  const second = WAYTYPE_LABELS[sorted[1].value] || "terrain mixte";
+  return `${label} (${pct} %) · ${second.toLowerCase()}`;
+}
+
+async function fetchOrsRoute(positions) {
+  const key = window.APP_CONFIG.ORS_API_KEY;
+  if (!key) return null;
+  try {
+    const res = await fetch("https://api.openrouteservice.org/v2/directions/foot-hiking/geojson", {
+      method: "POST",
+      headers: { Authorization: key, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        coordinates: positions.map(([lat, lng]) => [lng, lat]),
+        elevation: true,
+        extra_info: ["waytype"],
+      }),
+    });
+    if (!res.ok) return null;
+    const geo = await res.json();
+    const feature = geo.features && geo.features[0];
+    if (!feature) return null;
+
+    const coords = feature.geometry.coordinates.map(([lng, lat]) => [lat, lng]);
+    const elevations = feature.geometry.coordinates.map((c) => c[2] ?? 0);
+    const props = feature.properties || {};
+    const distanceKm = (props.summary && props.summary.distance != null ? props.summary.distance : pathDistanceKm(coords) * 1000) / 1000;
+
+    return {
+      coordinates: coords,
+      elevations,
+      distanceKm,
+      gainM: props.ascent != null ? props.ascent : null,
+      lossM: props.descent != null ? props.descent : null,
+      maxSlopePct: computeMaxSlopePct(coords, elevations),
+      surfaceSummary: summarizeWaytype(props.extras),
+      routed: true,
+    };
+  } catch (err) {
+    console.error("Itinéraire OpenRouteService indisponible", err);
+    return null;
+  }
+}
+
+async function fallbackStraightRoute(positions) {
+  const distanceKm = pathDistanceKm(positions);
+  try {
+    const dense = densifyPath(positions, 30);
+    const rawElevations = await fetchElevations(dense);
+    const { gain, loss, smoothed } = computeGainLoss(rawElevations);
+    return {
+      coordinates: dense,
+      elevations: smoothed,
+      distanceKm,
+      gainM: gain,
+      lossM: loss,
+      maxSlopePct: computeMaxSlopePct(dense, smoothed),
+      surfaceSummary: null,
+      routed: false,
+    };
+  } catch (err) {
+    console.error("Altitude indisponible", err);
+    return {
+      coordinates: positions,
+      elevations: null,
+      distanceKm,
+      gainM: null,
+      lossM: null,
+      maxSlopePct: null,
+      surfaceSummary: null,
+      routed: false,
+    };
+  }
+}
+
 // ---------- Geometry / elevation helpers ----------
 function haversineMeters([lat1, lon1], [lat2, lon2]) {
   const R = 6371000;
@@ -354,6 +549,18 @@ function pathDistanceKm(points) {
   let total = 0;
   for (let i = 1; i < points.length; i++) total += haversineMeters(points[i - 1], points[i]);
   return total / 1000;
+}
+
+function computeMaxSlopePct(coords, elevations) {
+  if (!elevations || elevations.length < 2) return null;
+  let max = 0;
+  for (let i = 1; i < coords.length; i++) {
+    const segM = haversineMeters(coords[i - 1], coords[i]);
+    if (segM < 3) continue;
+    const slope = Math.abs((elevations[i] - elevations[i - 1]) / segM) * 100;
+    if (slope > max) max = slope;
+  }
+  return max;
 }
 
 // Insert extra points along the path so elevation samples are ~every STEP meters
@@ -403,14 +610,6 @@ function computeGainLoss(elevations, smoothWindow = 3, noiseThresholdM = 1) {
     else if (diff < -noiseThresholdM) loss += -diff;
   }
   return { gain, loss, smoothed };
-}
-
-async function computeStats(points) {
-  const distanceKm = pathDistanceKm(points);
-  const dense = densifyPath(points, 30);
-  const elevations = await fetchElevations(dense);
-  const { gain, loss, smoothed } = computeGainLoss(elevations);
-  return { distanceKm, gainM: gain, lossM: loss, elevations: smoothed };
 }
 
 // ---------- Misc ----------

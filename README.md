@@ -1,10 +1,9 @@
 # Mes Randos
 
-Petite web app perso : une carte où tu traces tes randos (clic par clic), tu leur donnes un nom,
-et la distance + le dénivelé (D+/D-) sont calculés automatiquement.
+Petite web app perso : une carte où tu traces tes randos (clic par clic, en suivant les sentiers),
+tu leur donnes un nom, et la distance + le dénivelé sont calculés automatiquement.
 
 Le site est déjà en ligne : https://hapla-ventre.github.io/mes-randos/
-Il ne reste qu'à brancher Firebase (la base de données qui stocke tes randos) pour que ça fonctionne pour de vrai.
 
 ## Mise en place (à faire une seule fois, ~10 min)
 
@@ -37,6 +36,17 @@ donc si tu modifies le code en local pense à le recréer toi-même avec tes cl�
 Ouvre https://hapla-ventre.github.io/mes-randos/, clique **Créer un compte** avec ton email et un mot de passe.
 C'est un compte séparé de tout le reste (juste pour protéger tes données dans Firebase) — connecte-toi ensuite normalement.
 
+### 4. (Optionnel mais conseillé) Faire suivre les sentiers au tracé
+
+Sans cette étape, l'app trace une ligne droite entre tes points. Avec une clé gratuite OpenRouteService,
+elle calcule un vrai itinéraire à pied le long des chemins, avec dénivelé et type de terrain.
+
+1. Va sur https://openrouteservice.org, clique **Sign up**, crée un compte gratuit.
+2. Une fois connecté, va dans **Dashboard > Request a token**, choisis un nom libre, type **Standard**, valide.
+3. Copie le token affiché.
+4. Sur https://github.com/Hapla-ventre/mes-randos, ouvre `config.js` (bouton crayon pour éditer),
+   remplace la ligne `ORS_API_KEY: ""` par `ORS_API_KEY: "ton-token-ici",`, puis **Commit changes**.
+
 ## Mettre à jour le code plus tard
 
 Si tu modifies les fichiers en local, pousse simplement sur GitHub :
@@ -51,16 +61,23 @@ Le site se met à jour automatiquement en ~1 minute (GitHub Pages).
 
 ## Utilisation
 
-- **+ Nouvelle rando** → clique sur la carte pour poser les points de ton tracé (comme sur Outdooractive).
-- **Terminer le tracé** → l'app calcule distance + dénivelé (via l'altitude de chaque point, API gratuite Open-Meteo).
+- **+ Nouvelle rando** → clique sur la carte pour poser des points A, B, C… L'itinéraire entre eux suit
+  automatiquement les sentiers (si la clé OpenRouteService est configurée).
+- **Glisse un point** pour le corriger — le tracé se recalcule tout seul autour de sa nouvelle position,
+  et peut ainsi "sauter" sur un autre chemin.
+- **↩ Annuler point** retire le dernier point posé. **Terminer le tracé** fige distance, dénivelé, pente
+  max et type de terrain.
 - Donne un nom, une date, des notes éventuelles, puis **Enregistrer**.
-- Toutes tes randos apparaissent sur la carte avec des couleurs différentes, et dans la liste à gauche.
-- Clique sur une rando (dans la liste ou sur la carte) pour voir ses stats, son profil d'altitude, et pouvoir la supprimer.
+- La carte affiche toutes tes randos en gris discret, comme une toile de tes parcours. Clique sur une rando
+  (liste ou carte) pour la faire ressortir en couleur, voir ses stats, son profil d'altitude, et la supprimer.
 
 ## Notes techniques
 
-- Le dénivelé est approximatif : il dépend de la précision du tracé que tu dessines et de la résolution
-  du modèle d'altitude utilisé (~90m). Pour un tracé fidèle, clique des points assez rapprochés dans les zones vallonnées.
+- Le dénivelé et le type de terrain viennent d'OpenRouteService quand le tracé est routé ; sans clé, ou si
+  l'itinéraire est indisponible, l'app trace une ligne directe et calcule l'altitude via Open-Meteo (~90m de résolution).
 - Fond de carte IGN disponible via le sélecteur de calques en haut à droite (plus lisible pour la rando en France).
-- Aucune donnée n'est envoyée ailleurs qu'à ton propre projet Firebase et à l'API d'altitude Open-Meteo (anonyme, pas de clé).
+- Aucune donnée n'est envoyée ailleurs qu'à ton propre projet Firebase, à OpenRouteService (pour le calcul d'itinéraire)
+  et à Open-Meteo (altitude, en secours, anonyme et sans clé).
 - Leaflet et le SDK Firebase sont embarqués localement dans `vendor/` (pas de dépendance à un CDN externe).
+- L'édition ne concerne que le tracé en cours : une rando déjà enregistrée ne peut pas être re-modifiée pour
+  l'instant (seulement consultée ou supprimée) — à ajouter plus tard si besoin.
