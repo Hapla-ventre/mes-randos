@@ -160,6 +160,8 @@ button.danger:hover { background: var(--danger); color: white; }
 
 .empty-state { color: var(--hint); font-size: 13px; text-align: center; margin-top: 30px; }
 
+.app-version { color: var(--hint); font-size: 11px; text-align: center; margin: 16px 0 0; opacity: 0.7; }
+
 .detail-panel {
   position: absolute;
   top: 16px; right: 16px;

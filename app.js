@@ -6,6 +6,12 @@ const db = firebase.firestore();
 const COLOR_DEFAULT = "#c0392b";  // rando au repos (ou sélectionnée, en rayures blanc/rouge)
 const COLOR_EDITING = "#2980b9";  // rando en cours de modification / création
 
+// Bumped by hand on every change, shown in the sidebar footer — GitHub Pages can take a minute to
+// actually serve a new push, and the browser can also just be showing a cached copy, so this is
+// the one reliable way to confirm you're testing the version you think you're testing.
+const APP_VERSION = "v14 · 2026-08-17";
+document.getElementById("app-version").textContent = APP_VERSION;
+
 let leafletMap;
 let hikes = [];               // loaded from Firestore
 let hikeLayers = {};          // id -> { group, line }
@@ -103,6 +109,18 @@ async function migrateOutdatedElevations() {
       console.error("Recalcul du dénivelé impossible pour cette rando, réessaiera plus tard", h.id, err);
       // left un-stamped on purpose so it's retried next time the app loads, and nothing about
       // the hike itself (coordinates, waypoints, name, notes…) was ever touched either way
+      if (err.quotaExceeded) {
+        // Every remaining hike in this batch would hit the exact same hourly wall — stop here
+        // instead of burning through the rest one doomed attempt (and one 3x retry delay) at a
+        // time, and say so plainly instead of leaving the numbers silently unchanged with no clue
+        // why nothing seems to update no matter how many times the page is reloaded.
+        statusEl.textContent = `Limite de l'API d'altitude atteinte pour cette heure — le recalcul reprendra tout seul plus tard (${done}/${outdated.length} rando(s) faites pour l'instant).`;
+        await new Promise((resolve) => setTimeout(resolve, 4000));
+        statusEl.classList.add("hidden");
+        await loadHikes();
+        if (activeHikeId) showDetail(activeHikeId);
+        return;
+      }
     }
     done++;
     statusEl.textContent = `Recalcul du dénivelé de tes randos… ${done}/${outdated.length}`;
@@ -1158,9 +1176,8 @@ async function fetchElevations(points) {
 }
 
 // Open-Meteo's free tier rate-limits fairly aggressively (seen firsthand while building this) —
-// a 429 here isn't a real failure, just "try again shortly". Worth a couple of retries before
-// giving up, especially since this is what silently left some hikes un-recalculated when the
-// batch migration ran through many of them back to back.
+// a 429 here isn't always a brief "try again shortly", it can also mean the HOURLY request quota
+// is simply used up for the next while, which retrying within a few seconds can't fix at all.
 async function fetchElevationChunkWithRetry(lats, lons, attempt = 0) {
   const res = await fetch(`https://api.open-meteo.com/v1/elevation?latitude=${lats}&longitude=${lons}`);
   if (res.ok) {
@@ -1175,9 +1192,19 @@ async function fetchElevationChunkWithRetry(lats, lons, attempt = 0) {
     if (elevation.length !== expected) throw new Error(`Elevation count mismatch: got ${elevation.length}, expected ${expected}`);
     return elevation;
   }
-  if (res.status === 429 && attempt < 3) {
-    await new Promise((resolve) => setTimeout(resolve, 1500 * (attempt + 1)));
-    return fetchElevationChunkWithRetry(lats, lons, attempt + 1);
+  if (res.status === 429) {
+    if (attempt < 3) {
+      await new Promise((resolve) => setTimeout(resolve, 1500 * (attempt + 1)));
+      return fetchElevationChunkWithRetry(lats, lons, attempt + 1);
+    }
+    // Still 429 after 3 tries a few seconds apart: this reads as the free tier's HOURLY quota,
+    // not a momentary spike — retrying again right away won't help, and every other hike still
+    // queued in this migration batch would hit the exact same wall. Tag the error distinctly so
+    // the batch loop can give up entirely instead of burning through the rest of the queue one
+    // doomed attempt at a time.
+    const err = new Error("Elevation API quota exceeded");
+    err.quotaExceeded = true;
+    throw err;
   }
   throw new Error("Elevation API error");
 }
