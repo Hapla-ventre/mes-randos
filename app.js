@@ -570,18 +570,18 @@ function metersPerPixel(lat, zoom) {
   return (156543.03392 * Math.cos((lat * Math.PI) / 180)) / Math.pow(2, zoom);
 }
 
-// Approximation, not true segment-level route bundling: wherever paths pass within
-// OVERLAP_THRESHOLD_M of each other in reality — whether that's two different hikes, three or
-// more sharing the same stretch, or a single hike crossing its own earlier track on an
-// out-and-back — nudge every one of them apart perpendicular to the direction of travel so they
-// read like parallel metro lines instead of one solid stack. Everywhere else, paths stay exact.
+// Approximation, not true segment-level route bundling: wherever DIFFERENT hikes pass within
+// OVERLAP_THRESHOLD_M of each other in reality, nudge them apart perpendicular to the direction
+// of travel so they read like parallel metro lines instead of one solid stack. A single hike is
+// left alone where it crosses or retraces its own path (an out-and-back overlapping itself is
+// normal and fine) — only ever separated from OTHER hikes.
 const OVERLAP_THRESHOLD_M = 20;
-const OVERLAP_MIN_SELF_INDEX_GAP = 15; // how many points apart on the SAME hike before two nearby points count as a genuine second pass rather than just neighboring points on the same pass
+const OVERLAP_SMOOTH_WINDOW = 8; // points of smoothing on the offset, so it ramps in/out instead of snapping side to side
 
-// The expensive step: for every point of every hike, find which other points (any hike,
-// including a later point of the same hike) sit within OVERLAP_THRESHOLD_M, via a spatial grid
-// so this is roughly linear in the total point count instead of comparing every pair. Doesn't
-// depend on zoom, so it's cached by the caller and only rebuilt when the hikes actually change.
+// The expensive step: for every point of every hike, find which OTHER hikes have a point within
+// OVERLAP_THRESHOLD_M, via a spatial grid so this is roughly linear in the total point count
+// instead of comparing every pair. Doesn't depend on zoom, so it's cached by the caller and only
+// rebuilt when the hikes actually change.
 function buildOverlapClusters(hikeList) {
   const cellIndex = new Map();
   const cellSizeDeg = OVERLAP_THRESHOLD_M / 111320;
@@ -594,7 +594,7 @@ function buildOverlapClusters(hikeList) {
     h.coordinates.forEach(([lat, lng], i) => {
       const key = cellKey(lat, lng);
       if (!cellIndex.has(key)) cellIndex.set(key, []);
-      cellIndex.get(key).push({ hikeId: h.id, i, lat, lng });
+      cellIndex.get(key).push({ hikeId: h.id, lat, lng });
     });
   });
 
@@ -610,32 +610,45 @@ function buildOverlapClusters(hikeList) {
     return out;
   }
 
-  const clusters = {}; // hikeId -> array (same length as coordinates) of {rank, perpLat, perpLng} | null
-  hikeList.forEach((h) => { clusters[h.id] = new Array(h.coordinates.length).fill(null); });
+  // Raw per-point rank first — this alone is jittery, since which other hikes happen to fall
+  // within the threshold can flip point-to-point by a meter or two of digitizing noise.
+  const rawRanks = {};
+  hikeList.forEach((h) => { rawRanks[h.id] = new Array(h.coordinates.length).fill(0); });
 
   hikeList.forEach((h) => {
     h.coordinates.forEach(([lat, lng], i) => {
-      const candidates = neighborsOf(lat, lng).filter((q) => {
-        if (q.hikeId === h.id && q.i === i) return false;
-        if (q.hikeId === h.id && Math.abs(q.i - i) < OVERLAP_MIN_SELF_INDEX_GAP) return false;
-        return haversineMeters([lat, lng], [q.lat, q.lng]) < OVERLAP_THRESHOLD_M;
+      const otherHikeIds = new Set();
+      neighborsOf(lat, lng).forEach((q) => {
+        if (q.hikeId === h.id) return;
+        if (haversineMeters([lat, lng], [q.lat, q.lng]) < OVERLAP_THRESHOLD_M) otherHikeIds.add(q.hikeId);
       });
-      if (candidates.length === 0) return;
+      if (otherHikeIds.size === 0) return;
 
-      // Stable order across every occurrence found here (by hike id, then by point index for two
-      // passes of the SAME hike) — whoever else looks at this same spot sees the same ordering,
-      // so ranks never collide no matter how many paths converge here.
-      const occurrences = [{ hikeId: h.id, i }, ...candidates.map((c) => ({ hikeId: c.hikeId, i: c.i }))];
-      occurrences.sort((a, b) => (a.hikeId !== b.hikeId ? (a.hikeId < b.hikeId ? -1 : 1) : a.i - b.i));
-      const rank = occurrences.findIndex((o) => o.hikeId === h.id && o.i === i) - (occurrences.length - 1) / 2;
-      if (rank === 0) return;
+      // Stable order (by id) so every hike coincident here agrees on who takes which side.
+      const ids = [...otherHikeIds, h.id].sort();
+      rawRanks[h.id][i] = ids.indexOf(h.id) - (ids.length - 1) / 2;
+    });
+  });
 
-      const coords = h.coordinates;
+  // Smooth the rank along each hike's own sequence so the offset eases in and out gradually
+  // instead of snapping between sides — that snapping is what read as jagged "zigzags" before.
+  const clusters = {};
+  hikeList.forEach((h) => {
+    const raw = rawRanks[h.id];
+    const coords = h.coordinates;
+    clusters[h.id] = raw.map((_, i) => {
+      const start = Math.max(0, i - OVERLAP_SMOOTH_WINDOW);
+      const end = Math.min(raw.length, i + OVERLAP_SMOOTH_WINDOW + 1);
+      let sum = 0;
+      for (let j = start; j < end; j++) sum += raw[j];
+      const rank = sum / (end - start);
+      if (Math.abs(rank) < 0.05) return null;
+
       const prev = coords[Math.max(0, i - 1)];
       const next = coords[Math.min(coords.length - 1, i + 1)];
       const dLat = next[0] - prev[0], dLng = next[1] - prev[1];
       const len = Math.hypot(dLat, dLng) || 1;
-      clusters[h.id][i] = { rank, perpLat: -dLng / len, perpLng: dLat / len };
+      return { rank, perpLat: -dLng / len, perpLng: dLat / len };
     });
   });
 

@@ -79,8 +79,8 @@ Le site se met à jour automatiquement en ~1 minute (GitHub Pages).
   redeviennent déplaçables/ajoutables comme à la création, et toutes les autres randos disparaissent le
   temps de l'édition pour ne pas gêner. Enregistrer met à jour la même rando.
 - **Couleurs distinctes par rando** (case à cocher) : donne une couleur propre à chaque rando au lieu du
-  rouge uniforme. Les tronçons partagés par plusieurs randos (ou repassés deux fois sur la même, genre
-  aller-retour) s'écartent légèrement pour rester lisibles, un peu comme des lignes de métro qui se
+  rouge uniforme. Les tronçons partagés par plusieurs randos s'écartent légèrement pour rester lisibles,
+  un peu comme des lignes de métro qui se
   longent sans se superposer.
 - Le sélecteur de calques (haut à droite) propose un fond **Relief** avec courbes de niveau et estompage,
   en plus d'OpenStreetMap et IGN.
