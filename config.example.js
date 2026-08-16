@@ -1,6 +1,10 @@
 // Copie ce fichier en "config.js" et remplace les valeurs ci-dessous
-// par celles de ton projet Supabase (Project Settings > API).
+// par celles de ton projet Firebase (Project settings > General > Your apps > SDK setup and configuration).
 window.APP_CONFIG = {
-  SUPABASE_URL: "https://XXXXXXXXXXXX.supabase.co",
-  SUPABASE_ANON_KEY: "ta-clé-anon-publique-ici",
+  apiKey: "AIzaSy...",
+  authDomain: "ton-projet.firebaseapp.com",
+  projectId: "ton-projet",
+  storageBucket: "ton-projet.appspot.com",
+  messagingSenderId: "123456789",
+  appId: "1:123456789:web:xxxxxxxxxxxxxxxx",
 };

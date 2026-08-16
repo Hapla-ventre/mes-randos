@@ -1,10 +1,12 @@
 // ---------- Setup ----------
-const sb = window.supabase.createClient(window.APP_CONFIG.SUPABASE_URL, window.APP_CONFIG.SUPABASE_ANON_KEY);
+firebase.initializeApp(window.APP_CONFIG);
+const auth = firebase.auth();
+const db = firebase.firestore();
 
 const COLORS = ["#2e7d32", "#c0392b", "#2980b9", "#e67e22", "#8e44ad", "#16a085", "#d35400", "#2c3e50"];
 
 let leafletMap;
-let hikes = [];               // loaded from Supabase
+let hikes = [];               // loaded from Firestore
 let hikeLayers = {};          // id -> leaflet polyline
 let activeHikeId = null;
 
@@ -18,41 +20,39 @@ let pendingStats = null;
 const loginScreen = document.getElementById("login-screen");
 const appEl = document.getElementById("app");
 
-document.getElementById("btn-signin").addEventListener("click", () => doAuth("signInWithPassword"));
+document.getElementById("btn-signin").addEventListener("click", () => doAuth("signIn"));
 document.getElementById("btn-signup").addEventListener("click", () => doAuth("signUp"));
 document.getElementById("btn-logout").addEventListener("click", async () => {
-  await sb.auth.signOut();
-  location.reload();
+  await auth.signOut();
 });
 
-async function doAuth(method) {
+async function doAuth(mode) {
   const email = document.getElementById("login-email").value.trim();
   const password = document.getElementById("login-password").value;
   const errEl = document.getElementById("login-error");
   errEl.textContent = "";
+  errEl.style.color = "var(--danger)";
   if (!email || !password) {
     errEl.textContent = "Renseigne un email et un mot de passe.";
     return;
   }
-  const { error } = await sb.auth[method]({ email, password });
-  if (error) {
-    errEl.textContent = error.message;
-    return;
+  try {
+    if (mode === "signUp") {
+      await auth.createUserWithEmailAndPassword(email, password);
+    } else {
+      await auth.signInWithEmailAndPassword(email, password);
+    }
+  } catch (err) {
+    errEl.textContent = err.message;
   }
-  if (method === "signUp") {
-    errEl.style.color = "var(--green)";
-    errEl.textContent = "Compte créé. Si une confirmation par email est requise, vérifie ta boîte mail puis reconnecte-toi.";
-  }
-  await checkSession();
 }
 
-async function checkSession() {
-  const { data } = await sb.auth.getSession();
-  if (data.session) {
+function onAuthed(user) {
+  if (user) {
     loginScreen.classList.add("hidden");
     appEl.classList.remove("hidden");
     initMapIfNeeded();
-    await loadHikes();
+    loadHikes();
   } else {
     loginScreen.classList.remove("hidden");
     appEl.classList.add("hidden");
@@ -164,23 +164,23 @@ async function saveHike() {
   const date = document.getElementById("hike-date").value || null;
   const notes = document.getElementById("hike-notes").value.trim();
 
-  const { data: userData } = await sb.auth.getUser();
-
   const payload = {
-    user_id: userData.user.id,
+    userId: auth.currentUser.uid,
     name,
     date,
     notes,
-    coordinates: drawPoints,
-    distance_km: pendingStats.distanceKm,
-    elevation_gain_m: pendingStats.gainM,
-    elevation_loss_m: pendingStats.lossM,
+    coordinates: drawPoints.map(([lat, lng]) => ({ lat, lng })),
+    distanceKm: pendingStats.distanceKm,
+    elevationGainM: pendingStats.gainM,
+    elevationLossM: pendingStats.lossM,
     elevations: pendingStats.elevations,
+    createdAt: firebase.firestore.FieldValue.serverTimestamp(),
   };
 
-  const { error } = await sb.from("hikes").insert(payload);
-  if (error) {
-    alert("Erreur à l'enregistrement : " + error.message);
+  try {
+    await db.collection("hikes").add(payload);
+  } catch (err) {
+    alert("Erreur à l'enregistrement : " + err.message);
     return;
   }
 
@@ -197,12 +197,29 @@ async function saveHike() {
 
 // ---------- Load & render hikes ----------
 async function loadHikes() {
-  const { data, error } = await sb.from("hikes").select("*").order("date", { ascending: false });
-  if (error) {
-    console.error(error);
+  let snapshot;
+  try {
+    snapshot = await db.collection("hikes").where("userId", "==", auth.currentUser.uid).get();
+  } catch (err) {
+    console.error(err);
     return;
   }
-  hikes = data || [];
+  hikes = snapshot.docs
+    .map((doc) => {
+      const d = doc.data();
+      return {
+        id: doc.id,
+        name: d.name,
+        date: d.date,
+        notes: d.notes,
+        coordinates: d.coordinates.map((c) => [c.lat, c.lng]),
+        distanceKm: d.distanceKm,
+        elevationGainM: d.elevationGainM,
+        elevationLossM: d.elevationLossM,
+        elevations: d.elevations,
+      };
+    })
+    .sort((a, b) => (b.date || "").localeCompare(a.date || ""));
   renderHikeList();
   renderHikeLayers();
 }
@@ -220,7 +237,7 @@ function renderHikeList() {
     el.className = "hike-item" + (h.id === activeHikeId ? " active" : "");
     el.innerHTML = `
       <div class="name"><span class="swatch" style="background:${color}"></span>${escapeHtml(h.name)}</div>
-      <div class="meta">${h.date ? formatDate(h.date) : "Sans date"} · ${h.distance_km != null ? h.distance_km.toFixed(1) + " km" : ""}${h.elevation_gain_m != null ? " · D+ " + Math.round(h.elevation_gain_m) + " m" : ""}</div>
+      <div class="meta">${h.date ? formatDate(h.date) : "Sans date"} · ${h.distanceKm != null ? h.distanceKm.toFixed(1) + " km" : ""}${h.elevationGainM != null ? " · D+ " + Math.round(h.elevationGainM) + " m" : ""}</div>
     `;
     el.addEventListener("click", () => showDetail(h.id));
     listEl.appendChild(el);
@@ -254,9 +271,9 @@ function showDetail(id) {
   document.getElementById("detail-date").textContent = h.date ? formatDate(h.date) : "";
   document.getElementById("detail-notes").textContent = h.notes || "";
   renderStatsPreview("detail-stats", {
-    distanceKm: h.distance_km,
-    gainM: h.elevation_gain_m,
-    lossM: h.elevation_loss_m,
+    distanceKm: h.distanceKm,
+    gainM: h.elevationGainM,
+    lossM: h.elevationLossM,
   });
   drawElevationProfile(h.elevations);
   detailPanel.classList.remove("hidden");
@@ -275,9 +292,10 @@ function closeDetail() {
 document.getElementById("btn-delete-hike").addEventListener("click", async () => {
   if (!activeHikeId) return;
   if (!confirm("Supprimer cette rando ?")) return;
-  const { error } = await sb.from("hikes").delete().eq("id", activeHikeId);
-  if (error) {
-    alert("Erreur : " + error.message);
+  try {
+    await db.collection("hikes").doc(activeHikeId).delete();
+  } catch (err) {
+    alert("Erreur : " + err.message);
     return;
   }
   closeDetail();
@@ -408,5 +426,4 @@ function escapeHtml(str) {
 }
 
 // ---------- Boot ----------
-checkSession();
-sb.auth.onAuthStateChange(() => checkSession());
+auth.onAuthStateChanged(onAuthed);
