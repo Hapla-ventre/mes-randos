@@ -16,6 +16,7 @@ let sortMode = localStorage.getItem("sortMode") || "date";
 let overlapClustersCache = null;      // memoized coincidence detection, expensive part
 let overlapClustersForHikes = null;   // which `hikes` array + editing state the cache was built for
 let overlapClustersForEditingId = null;
+let overlapClustersForDistinctColors = null;
 
 let drawing = false;
 let editingHikeId = null;     // id of the hike being modified, or null when creating a new one
@@ -76,7 +77,7 @@ async function onAuthed(user) {
 // Bumped whenever the elevation/gain-loss/slope math changes in a way worth recomputing old
 // hikes for. Each hike stores the version it was last computed with; on login, any hike behind
 // this number gets its numbers refreshed automatically — nothing else about it is touched.
-const ELEVATION_SCHEMA_VERSION = 2;
+const ELEVATION_SCHEMA_VERSION = 3;
 
 async function migrateOutdatedElevations() {
   const outdated = hikes.filter((h) => h.elevationSchemaVersion < ELEVATION_SCHEMA_VERSION && h.coordinates.length > 1);
@@ -588,21 +589,21 @@ function renderHikeLayers() {
 
   const editingFiltered = hikes.filter((h) => h.id !== editingHikeId);
 
-  let coordsById = null;
-  if (distinctColorsEnabled) {
-    // The coincidence detection (which points sit on top of which) is the expensive part but
-    // doesn't depend on zoom at all — only the pixel→degrees conversion of the offset does. So
-    // it's cached here and only rebuilt when the hikes themselves change, while zooming just
-    // rescales the cached result — that's what keeps zoom/pan smooth with this mode on. Built
-    // from the full editing-filtered set regardless of isolation, so toggling "hide others" on
-    // and off doesn't force a recompute.
-    if (overlapClustersForHikes !== hikes || overlapClustersForEditingId !== editingHikeId) {
-      overlapClustersCache = buildOverlapClusters(editingFiltered);
-      overlapClustersForHikes = hikes;
-      overlapClustersForEditingId = editingHikeId;
-    }
-    coordsById = applyOverlapClusters(editingFiltered, overlapClustersCache, leafletMap.getZoom());
+  // Self-overlap (an out-and-back's return leg lying almost — but not quite — on top of its own
+  // outbound leg) is untangled unconditionally, since it's a rendering artifact of the geometry
+  // itself, not tied to the "distinct colors" feature. Separating DIFFERENT hikes from each other
+  // only makes sense once they actually have different colors, so that part stays gated. The
+  // coincidence detection is the expensive part but doesn't depend on zoom at all — only the
+  // pixel→degrees conversion of the offset does — so it's cached and only rebuilt when the hikes,
+  // the editing state, or the distinct-colors toggle change; zooming just rescales the cached
+  // result, which is what keeps zoom/pan smooth.
+  if (overlapClustersForHikes !== hikes || overlapClustersForEditingId !== editingHikeId || overlapClustersForDistinctColors !== distinctColorsEnabled) {
+    overlapClustersCache = buildOverlapClusters(editingFiltered, distinctColorsEnabled);
+    overlapClustersForHikes = hikes;
+    overlapClustersForEditingId = editingHikeId;
+    overlapClustersForDistinctColors = distinctColorsEnabled;
   }
+  const coordsById = applyOverlapClusters(editingFiltered, overlapClustersCache, leafletMap.getZoom());
 
   const visible = (isolateSelectedHike && activeHikeId)
     ? editingFiltered.filter((h) => h.id === activeHikeId)
@@ -611,7 +612,7 @@ function renderHikeLayers() {
   visible.forEach((h) => {
     const state = h.id === activeHikeId ? "selected" : "default";
     const baseColor = distinctColorsEnabled ? colorForHikeId(h.id) : COLOR_DEFAULT;
-    const coords = coordsById ? coordsById[h.id] : h.coordinates;
+    const coords = coordsById[h.id];
     const { group, line } = buildHikeLayerGroup(coords, state, baseColor);
     group.addTo(leafletMap);
     line.on("click", () => showDetail(h.id));
@@ -636,20 +637,21 @@ function metersPerPixel(lat, zoom) {
   return (156543.03392 * Math.cos((lat * Math.PI) / 180)) / Math.pow(2, zoom);
 }
 
-// Approximation, not true segment-level route bundling: wherever DIFFERENT hikes pass within
+// Approximation, not true segment-level route bundling: wherever paths pass within
 // OVERLAP_THRESHOLD_M of each other in reality, nudge them apart perpendicular to the direction
-// of travel so they read like parallel metro lines instead of one solid stack. A single hike is
-// left alone where it crosses or retraces its own path (an out-and-back overlapping itself is
-// normal and fine) — only ever separated from OTHER hikes.
+// of travel so they read like parallel metro lines instead of one solid stack (or, for an
+// out-and-back, like two clean parallel legs instead of one messy near-identical double line).
 const OVERLAP_THRESHOLD_M = 20;
 const OVERLAP_SMOOTH_WINDOW = 8; // points of smoothing on the offset, so it ramps in/out instead of snapping side to side
-const OVERLAP_MIN_RUN_POINTS = 6; // a couple of trails merely crossing at an angle stay within threshold for only a point or two — require a genuinely sustained run before treating it as "the same path", so a brief crossing doesn't get separated needlessly
+const OVERLAP_MIN_RUN_POINTS = 6; // two trails merely crossing at an angle (or a route brushing its own path once) stay within threshold for only a point or two — require a genuinely sustained run before treating it as "the same path", so a brief crossing doesn't get separated needlessly
+const OVERLAP_MIN_SELF_INDEX_GAP = 15; // how many points apart on the SAME hike before two nearby points count as a separate pass rather than just neighboring points on the same pass (e.g. a bend in the trail)
 
-// The expensive step: for every point of every hike, find which OTHER hikes have a point within
-// OVERLAP_THRESHOLD_M, via a spatial grid so this is roughly linear in the total point count
-// instead of comparing every pair. Doesn't depend on zoom, so it's cached by the caller and only
-// rebuilt when the hikes actually change.
-function buildOverlapClusters(hikeList) {
+// The expensive step: for every point of every hike, find every OTHER point within
+// OVERLAP_THRESHOLD_M — from a different hike (if includeOtherHikes), or a distant point of the
+// SAME hike retracing its own path (always) — via a spatial grid so this is roughly linear in
+// the total point count instead of comparing every pair. Doesn't depend on zoom, so it's cached
+// by the caller and only rebuilt when the hikes (or this flag) actually change.
+function buildOverlapClusters(hikeList, includeOtherHikes) {
   const cellIndex = new Map();
   const cellSizeDeg = OVERLAP_THRESHOLD_M / 111320;
 
@@ -661,7 +663,7 @@ function buildOverlapClusters(hikeList) {
     h.coordinates.forEach(([lat, lng], i) => {
       const key = cellKey(lat, lng);
       if (!cellIndex.has(key)) cellIndex.set(key, []);
-      cellIndex.get(key).push({ hikeId: h.id, lat, lng });
+      cellIndex.get(key).push({ hikeId: h.id, i, lat, lng });
     });
   });
 
@@ -677,61 +679,83 @@ function buildOverlapClusters(hikeList) {
     return out;
   }
 
-  // Which other hikes are within threshold at each point — kept per-partner (not summed yet) so
-  // a minimum-run-length filter can be applied per pair before it affects the rank.
-  const coincidentSets = {};
-  hikeList.forEach((h) => { coincidentSets[h.id] = h.coordinates.map(() => new Set()); });
+  // Which OTHER hikes are within threshold at each point (kept per-partner, not summed yet, so a
+  // minimum-run-length filter can be applied per pair) — and separately, whether this point's own
+  // hike passes near itself again later, and at which index.
+  const otherSets = {};
+  const selfMatchIndex = {}; // hikeId -> per-point index it re-meets its own path at, or -1
+  hikeList.forEach((h) => {
+    otherSets[h.id] = h.coordinates.map(() => new Set());
+    selfMatchIndex[h.id] = new Array(h.coordinates.length).fill(-1);
+  });
 
   hikeList.forEach((h) => {
     h.coordinates.forEach(([lat, lng], i) => {
       neighborsOf(lat, lng).forEach((q) => {
-        if (q.hikeId === h.id) return;
-        if (haversineMeters([lat, lng], [q.lat, q.lng]) < OVERLAP_THRESHOLD_M) coincidentSets[h.id][i].add(q.hikeId);
+        if (q.hikeId === h.id) {
+          if (Math.abs(q.i - i) < OVERLAP_MIN_SELF_INDEX_GAP) return;
+          if (selfMatchIndex[h.id][i] === -1 && haversineMeters([lat, lng], [q.lat, q.lng]) < OVERLAP_THRESHOLD_M) {
+            selfMatchIndex[h.id][i] = q.i;
+          }
+          return;
+        }
+        if (!includeOtherHikes) return;
+        if (haversineMeters([lat, lng], [q.lat, q.lng]) < OVERLAP_THRESHOLD_M) otherSets[h.id][i].add(q.hikeId);
       });
     });
   });
 
-  // Drop any (hike, other hike) pairing that isn't sustained for at least OVERLAP_MIN_RUN_POINTS
-  // in a row — two trails merely crossing at an angle only satisfy the distance threshold for a
+  // Drop any pairing (with another hike, or with the hike's own later pass) that isn't sustained
+  // for at least OVERLAP_MIN_RUN_POINTS in a row — a couple of trails merely crossing at an angle,
+  // or a route just grazing its own earlier path once, only satisfy the distance threshold for a
   // point or two, which isn't "running together" and shouldn't trigger a separation.
-  const filteredSets = {};
+  function filterRuns(n, presentAt) {
+    const filtered = new Array(n).fill(false);
+    let runStart = -1;
+    for (let i = 0; i <= n; i++) {
+      const present = i < n && presentAt(i);
+      if (present && runStart === -1) runStart = i;
+      if (!present && runStart !== -1) {
+        if (i - runStart >= OVERLAP_MIN_RUN_POINTS) {
+          for (let j = runStart; j < i; j++) filtered[j] = true;
+        }
+        runStart = -1;
+      }
+    }
+    return filtered;
+  }
+
+  const filteredOtherSets = {};
+  const filteredSelf = {};
   hikeList.forEach((h) => {
-    const raw = coincidentSets[h.id];
+    const raw = otherSets[h.id];
     const n = raw.length;
     const filtered = raw.map(() => new Set());
     const partners = new Set();
     raw.forEach((s) => s.forEach((id) => partners.add(id)));
     partners.forEach((otherId) => {
-      let runStart = -1;
-      for (let i = 0; i <= n; i++) {
-        const present = i < n && raw[i].has(otherId);
-        if (present && runStart === -1) runStart = i;
-        if (!present && runStart !== -1) {
-          if (i - runStart >= OVERLAP_MIN_RUN_POINTS) {
-            for (let j = runStart; j < i; j++) filtered[j].add(otherId);
-          }
-          runStart = -1;
-        }
-      }
+      filterRuns(n, (i) => raw[i].has(otherId)).forEach((keep, i) => { if (keep) filtered[i].add(otherId); });
     });
-    filteredSets[h.id] = filtered;
+    filteredOtherSets[h.id] = filtered;
+    filteredSelf[h.id] = filterRuns(n, (i) => selfMatchIndex[h.id][i] !== -1);
   });
 
-  // Raw per-point rank from the filtered sets — this alone is still a little jittery at the
-  // edges of a genuine overlap, hence the smoothing pass right after.
+  // Raw per-point rank: self-overlap contributes ±0.5 (earlier pass vs. later pass of the SAME
+  // hike always take opposite sides), and each coincident OTHER hike contributes ±0.5 via a fixed
+  // per-pair id comparison — not "sort whoever's nearby right now", which let a hike's side flip
+  // depending on transient company, causing two hikes to occasionally land on the same side (no
+  // separation) or a hike's own line to fork as its neighbor set changed. This is still a little
+  // jittery at the edges of a genuine overlap, hence the smoothing pass right after.
   const rawRanks = {};
   hikeList.forEach((h) => {
-    rawRanks[h.id] = filteredSets[h.id].map((otherHikeIds) => {
-      if (otherHikeIds.size === 0) return 0;
-      // Fixed per-pair rule (id comparison), not "sort whoever's nearby right now": hike A is
-      // always on the same side relative to hike B, everywhere the two of them meet, regardless
-      // of which other hikes also happen to be nearby at this particular point. Ranking by the
-      // local neighbor set instead — as a first version of this did — let a hike's side flip
-      // depending on transient company, which is what caused two hikes to occasionally land on
-      // the same side (no separation) or a hike's own line to fork as its neighbor set changed.
+    rawRanks[h.id] = h.coordinates.map((_, i) => {
       let sum = 0;
-      otherHikeIds.forEach((otherId) => { sum += h.id < otherId ? -1 : 1; });
-      return sum / 2;
+      if (filteredSelf[h.id][i]) {
+        const matchedIdx = selfMatchIndex[h.id][i];
+        sum += i < matchedIdx ? -0.5 : 0.5;
+      }
+      filteredOtherSets[h.id][i].forEach((otherId) => { sum += (h.id < otherId ? -1 : 1) / 2; });
+      return sum;
     });
   });
 
@@ -1036,12 +1060,14 @@ function pathDistanceKm(points) {
 
 function computeMaxSlopePct(coords, elevations) {
   if (!elevations || elevations.length < 2) return null;
-  // Below ~15m, normal DEM/GPS noise (a meter or two of elevation jitter) reads as a cliff —
-  // real trail grades need more horizontal run than that to be measured meaningfully. Routed
-  // geometry is often much denser than that (points every 1-5m), so comparing only immediate
-  // neighbors would skip virtually every pair and silently report ~0% for real hikes — instead,
-  // slide a window forward from each point to the first one at least MIN_SEGMENT_M further along.
-  const MIN_SEGMENT_M = 15;
+  // Matches the wide (25m) elevation smoothing: measuring slope over a span shorter than the
+  // smoothing window mostly just re-measures the smoothing kernel's own edge behavior, not real
+  // terrain, which is how a handful of hikes ended up with an absurd "177%" reading despite the
+  // display elevation already being smoothed. Routed geometry is often much denser than that
+  // (points every 1-5m), so comparing only immediate neighbors would also skip virtually every
+  // pair and silently report ~0% — instead, slide a window forward from each point to the first
+  // one at least MIN_SEGMENT_M further along.
+  const MIN_SEGMENT_M = 25;
   const cumDist = [0];
   for (let i = 1; i < coords.length; i++) cumDist.push(cumDist[i - 1] + haversineMeters(coords[i - 1], coords[i]));
 
@@ -1089,6 +1115,25 @@ async function fetchElevations(points) {
   return elevations;
 }
 
+// A single bad altitude sample (a DEM void or glitch — happens occasionally, especially near
+// cliffs, bridges, or forest edges) can still throw off a moving average even over a wide window,
+// since it's still one of the values being averaged. Replace anything wildly out of step with
+// its immediate neighbors by their median before smoothing even starts, so the rest of the curve
+// doesn't inherit its distortion.
+function rejectElevationOutliers(elevations, thresholdM = 40) {
+  return elevations.map((e, i) => {
+    const neighbors = [];
+    for (let d = 1; d <= 3; d++) {
+      if (i - d >= 0) neighbors.push(elevations[i - d]);
+      if (i + d < elevations.length) neighbors.push(elevations[i + d]);
+    }
+    if (neighbors.length === 0) return e;
+    neighbors.sort((a, b) => a - b);
+    const median = neighbors[Math.floor(neighbors.length / 2)];
+    return Math.abs(e - median) > thresholdM ? median : e;
+  });
+}
+
 // Two different smoothing widths for two different jobs, from the same raw altitude samples:
 // - a LIGHT pass (5m) feeds the hysteresis gain/loss calculation, which is itself already noise-
 //   robust (it only counts a leg once it reverses by 10m) — smoothing it further than this just
@@ -1100,9 +1145,10 @@ async function fetchElevations(points) {
 //   window to blend away, so the chart needs its own wider pass to look like a real profile
 //   instead of a flight of stairs.
 function deriveElevationStats(coords, rawElevations) {
-  const gainLossElevations = smoothElevations(coords, rawElevations, 5);
+  const cleaned = rejectElevationOutliers(rawElevations);
+  const gainLossElevations = smoothElevations(coords, cleaned, 5);
   const { gain, loss } = computeGainLossHysteresis(gainLossElevations);
-  const displayElevations = smoothElevations(coords, rawElevations, 25);
+  const displayElevations = smoothElevations(coords, cleaned, 25);
   return {
     gainM: gain,
     lossM: loss,

@@ -83,6 +83,9 @@ Le site se met à jour automatiquement en ~1 minute (GitHub Pages).
 - **Couleurs distinctes par rando** (case à cocher) : donne une couleur propre à chaque rando au lieu du
   rouge uniforme. Les tronçons partagés par plusieurs randos s'écartent légèrement pour rester lisibles,
   un peu comme des lignes de métro qui se longent sans se superposer.
+- Une rando en aller-retour (l'aller et le retour se recouvrent presque, mais rarement pixel pour pixel)
+  a ses deux passages légèrement écartés automatiquement, que les couleurs distinctes soient activées ou
+  non — sinon les deux traits presque superposés donnent une impression de "dédoublement".
 - Le sélecteur de calques (haut à droite) propose un fond **Relief** avec courbes de niveau et estompage,
   en plus d'OpenStreetMap et IGN.
 - La liste des randos (à gauche) peut être **triée par date, longueur ou dénivelé** via le menu au-dessus.
@@ -103,7 +106,9 @@ Le site se met à jour automatiquement en ~1 minute (GitHub Pages).
   dénivelé (le filtre à seuil ci-dessus gère déjà le bruit, un lissage trop large ferait sous-estimer les
   vraies petites variations de terrain), et un large (25m) pour le graphique de profil et la pente max
   (les données d'altitude sont souvent "blocs" de plusieurs dizaines de mètres, ce qui donne un effet
-  d'escalier si le tracé est échantillonné plus finement que ça).
+  d'escalier si le tracé est échantillonné plus finement que ça). Avant tout lissage, un échantillon
+  d'altitude isolé et très éloigné de ses voisins (un "trou" dans la donnée, ça arrive) est remplacé par
+  leur médiane, pour qu'il ne fausse pas la moyenne autour de lui.
 - Le fond **Relief** utilise les tuiles pré-calculées d'OpenTopoMap (courbes de niveau + ombrage à partir de
   données SRTM) — comme la plupart des applis de rando, l'estompage n'est pas recalculé à la volée dans le
   navigateur, ce serait beaucoup trop coûteux pour un rendu à la demande.
