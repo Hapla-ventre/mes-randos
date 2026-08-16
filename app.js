@@ -18,6 +18,7 @@ let editingHikeData = null;   // full hike object being modified, for prefilling
 let waypointMarkers = [];     // draggable L.marker[], in click order (A, B, C…)
 let waypointLayer = null;     // layer group holding the markers
 let routeLayer = null;        // visible polyline for the route currently being drawn/edited
+let routeOutlineLayer = null; // white halo companion drawn beneath routeLayer
 let routeResult = null;       // { coordinates, elevations, distanceKm, gainM, lossM, maxSlopePct, surfaceSummary, routed }
 let rerouteTimer = null;
 let rerouteToken = 0;
@@ -217,6 +218,8 @@ async function rebuildRoute() {
 
   routeResult = result;
   if (routeLayer) leafletMap.removeLayer(routeLayer);
+  if (routeOutlineLayer) leafletMap.removeLayer(routeOutlineLayer);
+  routeOutlineLayer = L.polyline(result.coordinates, { color: "#ffffff", weight: 7, opacity: 1 }).addTo(leafletMap);
   routeLayer = L.polyline(result.coordinates, {
     color: COLOR_EDITING, weight: 4, opacity: 0.9, className: "route-line-editable",
   }).addTo(leafletMap);
@@ -321,7 +324,10 @@ function startEditingHike(hike) {
   document.getElementById("btn-finish-draw").textContent = "Terminer la modification";
   drawPanel.classList.remove("hidden");
 
-  hike.waypoints.forEach((pos) => addWaypoint(L.latLng(pos[0], pos[1])));
+  // Hikes saved before routing existed have no separate "waypoints" — their coordinates
+  // were the raw click points, so they work as a starting point for editing.
+  const startPoints = hike.waypoints.length > 0 ? hike.waypoints : hike.coordinates;
+  startPoints.forEach((pos) => addWaypoint(L.latLng(pos[0], pos[1])));
 
   const bounds = L.polyline(hike.coordinates).getBounds();
   leafletMap.fitBounds(bounds, { padding: [40, 40] });
@@ -332,6 +338,7 @@ function resetDrawingState() {
   waypointMarkers = [];
   if (waypointLayer) { leafletMap.removeLayer(waypointLayer); waypointLayer = null; }
   if (routeLayer) { leafletMap.removeLayer(routeLayer); routeLayer = null; }
+  if (routeOutlineLayer) { leafletMap.removeLayer(routeOutlineLayer); routeOutlineLayer = null; }
   routeResult = null;
   document.getElementById("waypoint-list").innerHTML = "";
 }
@@ -551,11 +558,13 @@ function metersPerPixel(lat, zoom) {
 // Approximation, not true segment-level route bundling: wherever two hikes pass within
 // OFFSET_THRESHOLD_M of each other in reality, nudge them apart perpendicular to their
 // direction so they read like parallel metro lines instead of one solid stack. Everywhere
-// else, paths stay exact. The "are they close" check is a fixed real-world distance; the
-// visual gap itself is computed in pixels so it holds steady as the map is zoomed.
+// else, paths stay exact. The "are they close" check is a fixed real-world distance (generous,
+// since two independently-drawn/routed digitizations of "the same trail" can easily land
+// 15-20m apart); the visual gap itself is computed in pixels so it holds steady as the map
+// is zoomed, and sized to clear the line's full rendered width (halo included).
 function computeOverlapOffsets(hikeList) {
-  const OFFSET_THRESHOLD_M = 12;
-  const OFFSET_PIXELS = 4;
+  const OFFSET_THRESHOLD_M = 20;
+  const OFFSET_PIXELS = 8;
   const marginDeg = OFFSET_THRESHOLD_M / 111320;
   const zoom = leafletMap.getZoom();
 
@@ -566,7 +575,7 @@ function computeOverlapOffsets(hikeList) {
     const nearby = [];
     hikeList.forEach((other, oi) => {
       if (oi === hi) return;
-      if (boxesOverlap(boxes[hi], boxes[oi], marginDeg)) nearby.push(other.coordinates);
+      if (boxesOverlap(boxes[hi], boxes[oi], marginDeg)) nearby.push(other);
     });
 
     if (nearby.length === 0) {
@@ -575,16 +584,18 @@ function computeOverlapOffsets(hikeList) {
     }
 
     result[h.id] = h.coordinates.map(([lat, lng], i) => {
-      let coincidentCount = 0;
-      nearby.forEach((otherCoords) => {
-        if (otherCoords.some(([olat, olng]) => haversineMeters([lat, lng], [olat, olng]) < OFFSET_THRESHOLD_M)) {
-          coincidentCount++;
+      // Every hike coincident at this exact spot, sorted the same deterministic way (by id) no
+      // matter which of them is doing the computing — that's what guarantees two overlapping
+      // hikes always land on DIFFERENT sides instead of a coin-flip chance of picking the same one.
+      const coincidentIds = [h.id];
+      nearby.forEach((other) => {
+        if (other.coordinates.some(([olat, olng]) => haversineMeters([lat, lng], [olat, olng]) < OFFSET_THRESHOLD_M)) {
+          coincidentIds.push(other.id);
         }
       });
-      if (coincidentCount === 0) return [lat, lng];
-
-      // Stable per-hike rank (via id hash) so the same hike consistently offsets the same side.
-      const rank = ((colorForHikeIndex(h.id) % (coincidentCount + 1)) - coincidentCount / 2);
+      if (coincidentIds.length <= 1) return [lat, lng];
+      coincidentIds.sort();
+      const rank = coincidentIds.indexOf(h.id) - (coincidentIds.length - 1) / 2;
       if (rank === 0) return [lat, lng];
 
       const prev = h.coordinates[Math.max(0, i - 1)];
@@ -599,12 +610,6 @@ function computeOverlapOffsets(hikeList) {
   });
 
   return result;
-}
-
-function colorForHikeIndex(id) {
-  let hash = 0;
-  for (let i = 0; i < id.length; i++) hash = (hash * 31 + id.charCodeAt(i)) >>> 0;
-  return hash;
 }
 
 function boundsOf(coords) {
