@@ -9,7 +9,7 @@ const COLOR_EDITING = "#2980b9";  // rando en cours de modification / création
 // Bumped by hand on every change, shown in the sidebar footer — GitHub Pages can take a minute to
 // actually serve a new push, and the browser can also just be showing a cached copy, so this is
 // the one reliable way to confirm you're testing the version you think you're testing.
-const APP_VERSION = "v14 · 2026-08-17";
+const APP_VERSION = "v15 · 2026-08-17";
 document.getElementById("app-version").textContent = APP_VERSION;
 
 let leafletMap;
@@ -721,9 +721,7 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
     return filtered;
   }
 
-  // Pass 1: self-overlap only (a hike meeting its own path again later, e.g. an out-and-back's
-  // return leg) — computed first because pass 2 needs it to tell apart which OTHER hikes are
-  // themselves an out-and-back, so their two legs can be treated as separate tracks too.
+  // Self-overlap: a hike meeting its own path again later (e.g. an out-and-back's return leg).
   const selfMatchIndex = {}; // hikeId -> per-point index it re-meets its own path at, or -1
   hikeList.forEach((h) => { selfMatchIndex[h.id] = new Array(h.coordinates.length).fill(-1); });
   hikeList.forEach((h) => {
@@ -739,6 +737,34 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
   });
   const filteredSelf = {};
   hikeList.forEach((h) => { filteredSelf[h.id] = filterRuns(h.coordinates.length, (i) => selfMatchIndex[h.id][i] !== -1); });
+
+  // An out-and-back's two legs are rarely pixel-identical the whole way (the routed geometry for
+  // "there" and "back" can drift apart by a few extra meters here and there, e.g. around a
+  // junction), which made the OVERLAP_THRESHOLD_M distance check flicker in and out along an
+  // otherwise clearly-shared corridor — a short stretch here and there would drop back to
+  // "not overlapping" and render unoffset, right in the middle of two lines that are obviously
+  // the same out-and-back, instead of a clean, continuous separation the whole way. Bridge over
+  // short dropouts (a brief gap sandwiched between two confirmed self-overlap runs) by treating
+  // them as overlapping too, interpolating the missing match index between the two runs.
+  const BRIDGE_MAX_GAP_POINTS = 20;
+  function bridgeSelfGaps(filtered, matchIndex) {
+    const n = filtered.length;
+    let i = 0;
+    while (i < n) {
+      if (filtered[i]) { i++; continue; }
+      let j = i;
+      while (j < n && !filtered[j]) j++;
+      if (i > 0 && j < n && filtered[i - 1] && filtered[j] && (j - i) <= BRIDGE_MAX_GAP_POINTS) {
+        const startVal = matchIndex[i - 1], endVal = matchIndex[j];
+        for (let k = i; k < j; k++) {
+          filtered[k] = true;
+          matchIndex[k] = Math.round(startVal + (endVal - startVal) * ((k - (i - 1)) / (j - (i - 1))));
+        }
+      }
+      i = j;
+    }
+  }
+  hikeList.forEach((h) => { bridgeSelfGaps(filteredSelf[h.id], selfMatchIndex[h.id]); });
 
   // Pass 2: which OTHER hikes are within threshold at each point — kept per-partner, not summed
   // yet, so the run-length filter can be applied per pair. Deliberately simple (keyed by hikeId
