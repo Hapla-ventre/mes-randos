@@ -9,7 +9,7 @@ const COLOR_EDITING = "#2980b9";  // rando en cours de modification / création
 // Bumped by hand on every change, shown in the sidebar footer — GitHub Pages can take a minute to
 // actually serve a new push, and the browser can also just be showing a cached copy, so this is
 // the one reliable way to confirm you're testing the version you think you're testing.
-const APP_VERSION = "v17 · 2026-08-17";
+const APP_VERSION = "v18 · 2026-08-17";
 document.getElementById("app-version").textContent = APP_VERSION;
 
 let leafletMap;
@@ -667,6 +667,15 @@ const OVERLAP_THRESHOLD_M = 20;
 const OVERLAP_SMOOTH_WINDOW = 8; // points of smoothing on the offset, so it ramps in/out instead of snapping side to side
 const OVERLAP_MIN_RUN_POINTS = 6; // two trails merely crossing at an angle (or a route brushing its own path once) stay within threshold for only a point or two — require a genuinely sustained run before treating it as "the same path", so a brief crossing doesn't get separated needlessly
 const OVERLAP_MIN_SELF_INDEX_GAP = 15; // how many points apart on the SAME hike before two nearby points count as a separate pass rather than just neighboring points on the same pass (e.g. a bend in the trail)
+// A hike's own out-and-back gets a much MORE generous distance threshold than two different hikes
+// do: the two legs are routed independently (once "there", once "back"), and can end up genuinely
+// tens of meters apart around a trailhead, car park, or junction even though it's unmistakably the
+// same hike on the same trail — a mismatch that's completely harmless to merge (same color either
+// way, worst case the line is a few meters less precise over a short stretch). Merging two
+// DIFFERENT hikes too eagerly is the real risk (drawing genuinely different trails as one), so
+// that one stays conservative at OVERLAP_THRESHOLD_M.
+const SELF_OVERLAP_THRESHOLD_M = 50;
+const BRIDGE_MAX_GAP_POINTS = 60; // how many consecutive points of a short self-overlap dropout still get bridged into one continuous merge
 
 // The expensive step: for every point of every hike, find every OTHER point within
 // OVERLAP_THRESHOLD_M — from a different hike (if includeOtherHikes), or a distant point of the
@@ -675,7 +684,9 @@ const OVERLAP_MIN_SELF_INDEX_GAP = 15; // how many points apart on the SAME hike
 // by the caller and only rebuilt when the hikes (or this flag) actually change.
 function buildOverlapClusters(hikeList, includeOtherHikes) {
   const cellIndex = new Map();
-  const cellSizeDeg = OVERLAP_THRESHOLD_M / 111320;
+  // Sized to the LARGER of the two thresholds (self-overlap's is more generous — see above) so the
+  // ±1-cell neighbor scan below reliably reaches that far regardless of which check is running.
+  const cellSizeDeg = Math.max(OVERLAP_THRESHOLD_M, SELF_OVERLAP_THRESHOLD_M) / 111320;
 
   function cellKey(lat, lng) {
     return Math.floor(lat / cellSizeDeg) + "_" + Math.floor(lng / cellSizeDeg);
@@ -736,7 +747,7 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
         if (q.hikeId !== h.id) return;
         if (Math.abs(q.i - i) < OVERLAP_MIN_SELF_INDEX_GAP) return;
         const d = haversineMeters([lat, lng], [q.lat, q.lng]);
-        if (d < OVERLAP_THRESHOLD_M && d < bestDist) {
+        if (d < SELF_OVERLAP_THRESHOLD_M && d < bestDist) {
           bestDist = d;
           selfMatchIndex[h.id][i] = q.i;
         }
@@ -779,7 +790,6 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
   // the same out-and-back, instead of a clean, continuous separation the whole way. Bridge over
   // short dropouts (a brief gap sandwiched between two confirmed self-overlap runs) by treating
   // them as overlapping too, interpolating the missing match index between the two runs.
-  const BRIDGE_MAX_GAP_POINTS = 20;
   function bridgeSelfGaps(filtered, matchIndex) {
     const n = filtered.length;
     let i = 0;
@@ -860,14 +870,34 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
     for (let i = 0; i < key.length; i++) hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
     return 0.4 + (hash % 21) / 100; // 0.40 .. 0.60
   }
+
+  // With 2 partners in play, a hike's summed ± contributions can still land close to 0 purely by
+  // chance (e.g. -0.45 + 0.42) even though every individual pair-magnitude is comfortably nonzero
+  // — that reads as "no separation at all" right where several hikes converge, exactly where it's
+  // most needed. A single partner alone is always ≥0.40 (well clear of this), so only floor sums
+  // that are already small, and by a per-HIKE (not per-pair) amount — different hikes converging
+  // at the same point get different floors, so clamping doesn't reintroduce the same collision risk
+  // the per-pair magnitudes above were introduced to avoid.
+  function selfJitter(id) {
+    let hash = 0;
+    for (let i = 0; i < id.length; i++) hash = (hash * 31 + id.charCodeAt(i)) >>> 0;
+    return (hash % 15) / 1000; // 0 .. 0.014
+  }
   const rawOtherRanks = {};
   hikeList.forEach((h) => {
+    const floor = 0.3 + selfJitter(h.id);
     rawOtherRanks[h.id] = h.coordinates.map((_, i) => {
+      const partners = filteredOtherSets[h.id][i];
+      if (partners.size === 0) return 0;
       let sum = 0;
-      filteredOtherSets[h.id][i].forEach((otherId) => {
+      partners.forEach((otherId) => {
         const mag = pairMagnitude(h.id, otherId);
         sum += h.id < otherId ? -mag : mag;
       });
+      if (Math.abs(sum) < floor) {
+        const sign = sum !== 0 ? Math.sign(sum) : (selfJitter(h.id) < 0.007 ? -1 : 1);
+        sum = sign * floor;
+      }
       return sum;
     });
   });
