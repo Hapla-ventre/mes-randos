@@ -102,7 +102,10 @@ function initMapIfNeeded() {
   leafletMap.on("click", onMapClick);
 }
 
+let suppressNextMapClick = false;
+
 function onMapClick(e) {
+  if (suppressNextMapClick) { suppressNextMapClick = false; return; }
   if (!drawing) return;
   addWaypoint(e.latlng);
 }
@@ -123,7 +126,12 @@ function waypointIcon(index) {
 
 function createWaypointMarker(latlng, index) {
   const marker = L.marker(latlng, { icon: waypointIcon(index), draggable: true, zIndexOffset: 1000 }).addTo(waypointLayer);
-  marker.on("dragend", scheduleReroute);
+  marker.on("dragend", () => {
+    // the mouseup that ends a marker drag also reaches the map as a click — without this guard
+    // it would be read as "add a new point here" and append a stray point at the end.
+    suppressNextMapClick = true;
+    scheduleReroute();
+  });
   return marker;
 }
 
@@ -232,6 +240,7 @@ function onRouteLineMouseDown(e) {
     leafletMap.off("mousemove", onMove);
     leafletMap.off("mouseup", onUp);
     leafletMap.dragging.enable();
+    suppressNextMapClick = true; // same click-leak as marker drag — don't add a second point
     scheduleReroute();
   }
   leafletMap.on("mousemove", onMove);
@@ -480,14 +489,17 @@ function buildHikeLayerGroup(coords, state, baseColor) {
     line = L.polyline(coords, { color, weight: 4, opacity: 0.9 }).addTo(group);
   }
 
+  // Pixel offsets/repeat (not "%") so spacing tracks the map's current scale: zoom in and more
+  // arrowheads appear per screen, instead of them thinning out to nothing on a long hike.
   L.polylineDecorator(line, {
     patterns: [{
-      offset: "5%",
-      repeat: "10%",
+      offset: 20,
+      repeat: 90,
       symbol: L.Symbol.arrowHead({
-        pixelSize: 11,
+        pixelSize: 12,
+        headAngle: 50,       // narrower angle reads more clearly as a direction arrow
         polygon: true,
-        pathOptions: { color: "#ffffff", weight: 2.5, fillColor: "#161616", fillOpacity: 1 },
+        pathOptions: { color: "#ffffff", weight: 2, fillColor: "#161616", fillOpacity: 1, lineJoin: "round" },
       }),
     }],
   }).addTo(group);
@@ -757,9 +769,12 @@ async function fetchOrsRoute(positions) {
 
     const coords = feature.geometry.coordinates.map(([lng, lat]) => [lat, lng]);
     // ORS returns one elevation sample per vertex, which can sit only 1-2m apart on curves —
-    // at that spacing, tiny DEM rounding reads as a cliff. Smooth before using it for anything.
+    // at that spacing, tiny DEM rounding reads as a cliff. Smooth before using it for anything,
+    // and compute D+/D- ourselves (ORS's own ascent/descent sums every bit of that same DEM
+    // noise with no filtering, which is why it ran noticeably higher than other apps).
     const rawElevations = feature.geometry.coordinates.map((c) => c[2] ?? 0);
-    const { smoothed: elevations } = computeGainLoss(rawElevations, 5);
+    const elevations = smoothElevations(rawElevations, 5);
+    const { gain, loss } = computeGainLossHysteresis(elevations);
     const props = feature.properties || {};
     const distanceKm = (props.summary && props.summary.distance != null ? props.summary.distance : pathDistanceKm(coords) * 1000) / 1000;
 
@@ -767,8 +782,8 @@ async function fetchOrsRoute(positions) {
       coordinates: coords,
       elevations,
       distanceKm,
-      gainM: props.ascent != null ? props.ascent : null,
-      lossM: props.descent != null ? props.descent : null,
+      gainM: gain,
+      lossM: loss,
       maxSlopePct: computeMaxSlopePct(coords, elevations),
       surfaceSummary: summarizeWaytype(props.extras),
       routed: true,
@@ -784,14 +799,15 @@ async function fallbackStraightRoute(positions) {
   try {
     const dense = densifyPath(positions, 30);
     const rawElevations = await fetchElevations(dense);
-    const { gain, loss, smoothed } = computeGainLoss(rawElevations);
+    const elevations = smoothElevations(rawElevations);
+    const { gain, loss } = computeGainLossHysteresis(elevations);
     return {
       coordinates: dense,
-      elevations: smoothed,
+      elevations,
       distanceKm,
       gainM: gain,
       lossM: loss,
-      maxSlopePct: computeMaxSlopePct(dense, smoothed),
+      maxSlopePct: computeMaxSlopePct(dense, elevations),
       surfaceSummary: null,
       routed: false,
     };
@@ -874,22 +890,54 @@ async function fetchElevations(points) {
   return elevations;
 }
 
-// Smooth with a simple moving average to reduce dataset noise, then sum gains/losses
-function computeGainLoss(elevations, smoothWindow = 3, noiseThresholdM = 1) {
-  const smoothed = elevations.map((_, i) => {
-    const start = Math.max(0, i - smoothWindow);
-    const end = Math.min(elevations.length, i + smoothWindow + 1);
+// Simple moving average, just to take the edge off per-vertex DEM noise before it's charted
+// or fed to the gain/loss algorithm below.
+function smoothElevations(elevations, window = 3) {
+  return elevations.map((_, i) => {
+    const start = Math.max(0, i - window);
+    const end = Math.min(elevations.length, i + window + 1);
     const slice = elevations.slice(start, end);
     return slice.reduce((a, b) => a + b, 0) / slice.length;
   });
+}
 
+// Elevation gain/loss via a hysteresis ("swing") filter: a climb only counts once it reverses
+// by at least thresholdM, same principle GPS trip computers and hiking apps use so that every
+// meter of DEM jitter doesn't get added up into inflated D+/D- numbers.
+function computeGainLossHysteresis(elevations, thresholdM = 10) {
+  if (!elevations || elevations.length < 2) return { gain: 0, loss: 0 };
   let gain = 0, loss = 0;
-  for (let i = 1; i < smoothed.length; i++) {
-    const diff = smoothed[i] - smoothed[i - 1];
-    if (diff > noiseThresholdM) gain += diff;
-    else if (diff < -noiseThresholdM) loss += -diff;
+  let base = elevations[0];
+  let extreme = elevations[0];
+  let rising = null; // null = undecided yet, true = tracking a rise, false = tracking a fall
+
+  for (let i = 1; i < elevations.length; i++) {
+    const e = elevations[i];
+    if (rising !== false) {
+      if (e >= extreme) { extreme = e; rising = true; continue; }
+      if (extreme - e >= thresholdM) {
+        gain += extreme - base;
+        base = extreme;
+        extreme = e;
+        rising = false;
+        continue;
+      }
+    }
+    if (rising !== true) {
+      if (e <= extreme) { extreme = e; rising = false; continue; }
+      if (e - extreme >= thresholdM) {
+        loss += base - extreme;
+        base = extreme;
+        extreme = e;
+        rising = true;
+      }
+    }
   }
-  return { gain, loss, smoothed };
+
+  if (rising === true) gain += extreme - base;
+  else if (rising === false) loss += base - extreme;
+
+  return { gain, loss };
 }
 
 // ---------- Misc ----------
