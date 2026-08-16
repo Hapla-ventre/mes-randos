@@ -75,8 +75,9 @@ Le site se met à jour automatiquement en ~1 minute (GitHub Pages).
   pour bien ressortir, et tu peux voir ses stats, son profil d'altitude, la modifier ou la supprimer.
 - Dans le panneau d'une rando, coche **Masquer les autres randos** pour ne garder que celle-ci affichée
   (la vue se recentre dessus) — pratique pour l'examiner sans le reste de la carte autour.
-- Dans le panneau d'une rando, le **nom et la date sont modifiables directement** — change-les puis clique
-  **💾 Enregistrer nom / date / notes** (ça ne touche pas au tracé, donc ni recalcul ni doublon).
+- Dans le panneau d'une rando, le **nom, la date et les notes sont modifiables directement** — les
+  changements s'enregistrent tout seuls au fur et à mesure (ça ne touche pas au tracé, donc ni
+  recalcul ni doublon).
 - **✎ Modifier le tracé** repasse en mode édition des points : la rando devient **bleue**, ses points
   redeviennent déplaçables/ajoutables comme à la création, et toutes les autres randos disparaissent le
   temps de l'édition pour ne pas gêner. Enregistrer met à jour la même rando.

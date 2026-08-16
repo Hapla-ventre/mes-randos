@@ -111,6 +111,10 @@ async function migrateOutdatedElevations() {
 
   statusEl.classList.add("hidden");
   await loadHikes();
+  // loadHikes() replaces the `hikes` array with the freshly recalculated numbers, but the detail
+  // panel (if open) was filled in from the old snapshot at the time it was shown — without this,
+  // the stats/profile on screen stay stale until the user closes and reopens it.
+  if (activeHikeId) showDetail(activeHikeId);
 }
 
 const chkDistinctColors = document.getElementById("chk-distinct-colors");
@@ -679,36 +683,10 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
     return out;
   }
 
-  // Which OTHER hikes are within threshold at each point (kept per-partner, not summed yet, so a
-  // minimum-run-length filter can be applied per pair) — and separately, whether this point's own
-  // hike passes near itself again later, and at which index.
-  const otherSets = {};
-  const selfMatchIndex = {}; // hikeId -> per-point index it re-meets its own path at, or -1
-  hikeList.forEach((h) => {
-    otherSets[h.id] = h.coordinates.map(() => new Set());
-    selfMatchIndex[h.id] = new Array(h.coordinates.length).fill(-1);
-  });
-
-  hikeList.forEach((h) => {
-    h.coordinates.forEach(([lat, lng], i) => {
-      neighborsOf(lat, lng).forEach((q) => {
-        if (q.hikeId === h.id) {
-          if (Math.abs(q.i - i) < OVERLAP_MIN_SELF_INDEX_GAP) return;
-          if (selfMatchIndex[h.id][i] === -1 && haversineMeters([lat, lng], [q.lat, q.lng]) < OVERLAP_THRESHOLD_M) {
-            selfMatchIndex[h.id][i] = q.i;
-          }
-          return;
-        }
-        if (!includeOtherHikes) return;
-        if (haversineMeters([lat, lng], [q.lat, q.lng]) < OVERLAP_THRESHOLD_M) otherSets[h.id][i].add(q.hikeId);
-      });
-    });
-  });
-
-  // Drop any pairing (with another hike, or with the hike's own later pass) that isn't sustained
-  // for at least OVERLAP_MIN_RUN_POINTS in a row — a couple of trails merely crossing at an angle,
-  // or a route just grazing its own earlier path once, only satisfy the distance threshold for a
-  // point or two, which isn't "running together" and shouldn't trigger a separation.
+  // Drop any pairing (with another hike's track, or with the hike's own later pass) that isn't
+  // sustained for at least OVERLAP_MIN_RUN_POINTS in a row — a couple of trails merely crossing at
+  // an angle, or a route just grazing its own earlier path once, only satisfy the distance
+  // threshold for a point or two, which isn't "running together" and shouldn't trigger a separation.
   function filterRuns(n, presentAt) {
     const filtered = new Array(n).fill(false);
     let runStart = -1;
@@ -725,37 +703,88 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
     return filtered;
   }
 
-  const filteredOtherSets = {};
+  // Pass 1: self-overlap only (a hike meeting its own path again later, e.g. an out-and-back's
+  // return leg) — computed first because pass 2 needs it to tell apart which OTHER hikes are
+  // themselves an out-and-back, so their two legs can be treated as separate tracks too.
+  const selfMatchIndex = {}; // hikeId -> per-point index it re-meets its own path at, or -1
+  hikeList.forEach((h) => { selfMatchIndex[h.id] = new Array(h.coordinates.length).fill(-1); });
+  hikeList.forEach((h) => {
+    h.coordinates.forEach(([lat, lng], i) => {
+      neighborsOf(lat, lng).forEach((q) => {
+        if (q.hikeId !== h.id) return;
+        if (Math.abs(q.i - i) < OVERLAP_MIN_SELF_INDEX_GAP) return;
+        if (selfMatchIndex[h.id][i] === -1 && haversineMeters([lat, lng], [q.lat, q.lng]) < OVERLAP_THRESHOLD_M) {
+          selfMatchIndex[h.id][i] = q.i;
+        }
+      });
+    });
+  });
   const filteredSelf = {};
+  hikeList.forEach((h) => { filteredSelf[h.id] = filterRuns(h.coordinates.length, (i) => selfMatchIndex[h.id][i] !== -1); });
+
+  // The "track" a given point of a given hike belongs to: its own id, or — once it's confirmed to
+  // be retracing its own path — id+"#a"/"#b" depending on which of the two passes this is. Two
+  // different hikes overlapping the SAME physical trail at the same spot always get two distinct
+  // keys (different ids); a single hike's out-and-back gets two distinct keys too (different
+  // suffix) — so no two genuinely different tracks can ever collide onto the same key.
+  function trackKeyFor(hikeId, i) {
+    return filteredSelf[hikeId][i] ? hikeId + (i < selfMatchIndex[hikeId][i] ? "#a" : "#b") : hikeId;
+  }
+
+  // Pass 2: which OTHER tracks are within threshold at each point — kept per-partner, not summed
+  // yet, so the run-length filter can be applied per pair. "Other" here means any track (via
+  // trackKeyFor, so pass-aware) whose key differs from this point's own — which covers both a
+  // different hike's line AND this hike's own opposite pass meeting back up with itself. Treating
+  // both cases through the same key comparison is what lets a point simultaneously separate from
+  // its own return leg AND from a different hike overlapping the same spot, instead of only one.
+  const otherSets = {};
+  hikeList.forEach((h) => { otherSets[h.id] = h.coordinates.map(() => new Set()); });
+  hikeList.forEach((h) => {
+    h.coordinates.forEach(([lat, lng], i) => {
+      const ownKey = trackKeyFor(h.id, i);
+      neighborsOf(lat, lng).forEach((q) => {
+        if (q.hikeId === h.id) {
+          if (Math.abs(q.i - i) < OVERLAP_MIN_SELF_INDEX_GAP) return;
+        } else if (!includeOtherHikes) {
+          return;
+        }
+        if (haversineMeters([lat, lng], [q.lat, q.lng]) >= OVERLAP_THRESHOLD_M) return;
+        const key = trackKeyFor(q.hikeId, q.i);
+        if (key !== ownKey) otherSets[h.id][i].add(key);
+      });
+    });
+  });
+  const filteredOtherSets = {};
   hikeList.forEach((h) => {
     const raw = otherSets[h.id];
     const n = raw.length;
     const filtered = raw.map(() => new Set());
     const partners = new Set();
-    raw.forEach((s) => s.forEach((id) => partners.add(id)));
-    partners.forEach((otherId) => {
-      filterRuns(n, (i) => raw[i].has(otherId)).forEach((keep, i) => { if (keep) filtered[i].add(otherId); });
+    raw.forEach((s) => s.forEach((key) => partners.add(key)));
+    partners.forEach((key) => {
+      filterRuns(n, (i) => raw[i].has(key)).forEach((keep, i) => { if (keep) filtered[i].add(key); });
     });
     filteredOtherSets[h.id] = filtered;
-    filteredSelf[h.id] = filterRuns(n, (i) => selfMatchIndex[h.id][i] !== -1);
   });
 
-  // Raw per-point rank: self-overlap contributes ±0.5 (earlier pass vs. later pass of the SAME
-  // hike always take opposite sides), and each coincident OTHER hike contributes ±0.5 via a fixed
-  // per-pair id comparison — not "sort whoever's nearby right now", which let a hike's side flip
-  // depending on transient company, causing two hikes to occasionally land on the same side (no
-  // separation) or a hike's own line to fork as its neighbor set changed. This is still a little
-  // jittery at the edges of a genuine overlap, hence the smoothing pass right after.
+  // Raw per-point rank: every distinct track present at this point (this hike's own — via
+  // trackKeyFor, so an out-and-back's two passes count separately — plus each coincident OTHER
+  // track, also pass-aware) is sorted by a fixed key so the order never depends on "who's nearby
+  // right now", then this point's own track gets its ordinal position, centered around 0. This
+  // used to instead SUM a ±0.5 self contribution with a ±0.5 per-partner contribution, which could
+  // cancel out to exactly 0 — e.g. an out-and-back's own pass landing on the "wrong" side of a
+  // same-color coincidence with another hike — leaving that stretch completely unoffset and hidden
+  // under whatever it overlapped. Ordinal ranking can't cancel: with N tracks present, each one
+  // gets its own slot. Still a little jittery at the edges of a genuine overlap, hence the
+  // smoothing pass right after.
   const rawRanks = {};
   hikeList.forEach((h) => {
     rawRanks[h.id] = h.coordinates.map((_, i) => {
-      let sum = 0;
-      if (filteredSelf[h.id][i]) {
-        const matchedIdx = selfMatchIndex[h.id][i];
-        sum += i < matchedIdx ? -0.5 : 0.5;
-      }
-      filteredOtherSets[h.id][i].forEach((otherId) => { sum += (h.id < otherId ? -1 : 1) / 2; });
-      return sum;
+      const ownKey = trackKeyFor(h.id, i);
+      const tracks = [ownKey, ...filteredOtherSets[h.id][i]];
+      if (tracks.length === 1) return 0;
+      tracks.sort();
+      return tracks.indexOf(ownKey) - (tracks.length - 1) / 2;
     });
   });
 
@@ -805,6 +834,7 @@ function applyOverlapClusters(hikeList, clusters, zoom) {
 const detailPanel = document.getElementById("detail-panel");
 
 function showDetail(id) {
+  flushAutoSaveInfo(); // don't lose an unsaved edit on the hike we're navigating away from
   activeHikeId = id;
   const h = hikes.find((x) => x.id === id);
   if (!h) return;
@@ -838,6 +868,7 @@ document.getElementById("chk-isolate-hike").addEventListener("change", (e) => {
 
 document.getElementById("btn-close-detail").addEventListener("click", closeDetail);
 function closeDetail() {
+  flushAutoSaveInfo();
   activeHikeId = null;
   isolateSelectedHike = false; // isolating only makes sense while a hike's detail is open
   document.getElementById("chk-isolate-hike").checked = false;
@@ -851,22 +882,46 @@ document.getElementById("btn-edit-hike").addEventListener("click", () => {
   if (h) startEditingHike(h);
 });
 
-// Quick edit for name/date/notes only — no need to touch the route just to fix a typo or a date.
-document.getElementById("btn-save-info").addEventListener("click", async () => {
+// Quick edit for name/date/notes only — no need to touch the route just to fix a typo or a date,
+// and no explicit save button: every change is persisted automatically (debounced while typing,
+// immediately on the date picker, and flushed on close/switch so nothing typed is lost).
+let autoSaveInfoTimer = null;
+
+function scheduleAutoSaveInfo() {
+  clearTimeout(autoSaveInfoTimer);
+  autoSaveInfoTimer = setTimeout(saveDetailInfo, 600);
+}
+
+function flushAutoSaveInfo() {
+  if (autoSaveInfoTimer) {
+    clearTimeout(autoSaveInfoTimer);
+    autoSaveInfoTimer = null;
+    saveDetailInfo();
+  }
+}
+
+async function saveDetailInfo() {
   if (!activeHikeId) return;
+  const id = activeHikeId;
   const name = document.getElementById("detail-name-input").value.trim() || "Rando sans nom";
   const date = document.getElementById("detail-date-input").value || null;
   const notes = document.getElementById("detail-notes-input").value.trim();
+  const h = hikes.find((x) => x.id === id);
+  if (h && h.name === name && h.date === date && (h.notes || "") === notes) return; // nothing changed
+
   try {
-    await db.collection("hikes").doc(activeHikeId).update({ name, date, notes });
+    await db.collection("hikes").doc(id).update({ name, date, notes });
   } catch (err) {
-    alert("Erreur : " + err.message);
+    console.error("Erreur d'enregistrement automatique", err);
     return;
   }
-  const id = activeHikeId;
-  await loadHikes();
-  showDetail(id);
-});
+  if (h) { h.name = name; h.date = date; h.notes = notes; }
+  renderHikeList();
+}
+
+document.getElementById("detail-name-input").addEventListener("input", scheduleAutoSaveInfo);
+document.getElementById("detail-notes-input").addEventListener("input", scheduleAutoSaveInfo);
+document.getElementById("detail-date-input").addEventListener("change", saveDetailInfo);
 
 document.getElementById("btn-delete-hike").addEventListener("click", async () => {
   if (!activeHikeId) return;
