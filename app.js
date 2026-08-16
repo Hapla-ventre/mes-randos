@@ -10,6 +10,7 @@ let leafletMap;
 let hikes = [];               // loaded from Firestore
 let hikeLayers = {};          // id -> { group, line }
 let activeHikeId = null;
+let isolateSelectedHike = false;
 let distinctColorsEnabled = localStorage.getItem("distinctColors") === "1";
 let overlapClustersCache = null;      // memoized coincidence detection, expensive part
 let overlapClustersForHikes = null;   // which `hikes` array + editing state the cache was built for
@@ -526,21 +527,27 @@ function renderHikeLayers() {
   hikeLayers = {};
   if (drawing) return; // keep the map clear of every other hike while actively drawing/editing one
 
-  const visible = hikes.filter((h) => h.id !== editingHikeId);
+  const editingFiltered = hikes.filter((h) => h.id !== editingHikeId);
 
   let coordsById = null;
   if (distinctColorsEnabled) {
     // The coincidence detection (which points sit on top of which) is the expensive part but
     // doesn't depend on zoom at all — only the pixel→degrees conversion of the offset does. So
     // it's cached here and only rebuilt when the hikes themselves change, while zooming just
-    // rescales the cached result — that's what keeps zoom/pan smooth with this mode on.
+    // rescales the cached result — that's what keeps zoom/pan smooth with this mode on. Built
+    // from the full editing-filtered set regardless of isolation, so toggling "hide others" on
+    // and off doesn't force a recompute.
     if (overlapClustersForHikes !== hikes || overlapClustersForEditingId !== editingHikeId) {
-      overlapClustersCache = buildOverlapClusters(visible);
+      overlapClustersCache = buildOverlapClusters(editingFiltered);
       overlapClustersForHikes = hikes;
       overlapClustersForEditingId = editingHikeId;
     }
-    coordsById = applyOverlapClusters(visible, overlapClustersCache, leafletMap.getZoom());
+    coordsById = applyOverlapClusters(editingFiltered, overlapClustersCache, leafletMap.getZoom());
   }
+
+  const visible = (isolateSelectedHike && activeHikeId)
+    ? editingFiltered.filter((h) => h.id === activeHikeId)
+    : editingFiltered;
 
   visible.forEach((h) => {
     const state = h.id === activeHikeId ? "selected" : "default";
@@ -624,9 +631,15 @@ function buildOverlapClusters(hikeList) {
       });
       if (otherHikeIds.size === 0) return;
 
-      // Stable order (by id) so every hike coincident here agrees on who takes which side.
-      const ids = [...otherHikeIds, h.id].sort();
-      rawRanks[h.id][i] = ids.indexOf(h.id) - (ids.length - 1) / 2;
+      // Fixed per-pair rule (id comparison), not "sort whoever's nearby right now": hike A is
+      // always on the same side relative to hike B, everywhere the two of them meet, regardless
+      // of which other hikes also happen to be nearby at this particular point. Ranking by the
+      // local neighbor set instead — as a first version of this did — let a hike's side flip
+      // depending on transient company, which is what caused two hikes to occasionally land on
+      // the same side (no separation) or a hike's own line to fork as its neighbor set changed.
+      let sum = 0;
+      otherHikeIds.forEach((otherId) => { sum += h.id < otherId ? -1 : 1; });
+      rawRanks[h.id][i] = sum / 2;
     });
   });
 
@@ -693,15 +706,25 @@ function showDetail(id) {
   renderExtraInfo("detail-extra-info", h);
   drawElevationProfile(h.elevations);
   detailPanel.classList.remove("hidden");
+  document.getElementById("chk-isolate-hike").checked = isolateSelectedHike;
 
   renderHikeLayers();
   const layer = hikeLayers[id];
   if (layer) leafletMap.fitBounds(layer.line.getBounds(), { padding: [40, 40] });
 }
 
+document.getElementById("chk-isolate-hike").addEventListener("change", (e) => {
+  isolateSelectedHike = e.target.checked;
+  renderHikeLayers();
+  const layer = hikeLayers[activeHikeId];
+  if (layer) leafletMap.fitBounds(layer.line.getBounds(), { padding: [40, 40] });
+});
+
 document.getElementById("btn-close-detail").addEventListener("click", closeDetail);
 function closeDetail() {
   activeHikeId = null;
+  isolateSelectedHike = false; // isolating only makes sense while a hike's detail is open
+  document.getElementById("chk-isolate-hike").checked = false;
   detailPanel.classList.add("hidden");
   renderHikeList();
   renderHikeLayers();

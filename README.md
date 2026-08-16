@@ -73,6 +73,8 @@ Le site se met à jour automatiquement en ~1 minute (GitHub Pages).
 - Sur la carte, une rando enregistrée est **rouge avec des flèches noires à contour blanc** indiquant le
   sens de parcours. En la sélectionnant (liste ou clic sur la carte) elle passe en **rayures rouge/blanc**
   pour bien ressortir, et tu peux voir ses stats, son profil d'altitude, la modifier ou la supprimer.
+- Dans le panneau d'une rando, coche **Masquer les autres randos** pour ne garder que celle-ci affichée
+  (la vue se recentre dessus) — pratique pour l'examiner sans le reste de la carte autour.
 - Dans le panneau d'une rando, le **nom et la date sont modifiables directement** — change-les puis clique
   **💾 Enregistrer nom / date / notes** (ça ne touche pas au tracé, donc ni recalcul ni doublon).
 - **✎ Modifier le tracé** repasse en mode édition des points : la rando devient **bleue**, ses points
@@ -80,8 +82,7 @@ Le site se met à jour automatiquement en ~1 minute (GitHub Pages).
   temps de l'édition pour ne pas gêner. Enregistrer met à jour la même rando.
 - **Couleurs distinctes par rando** (case à cocher) : donne une couleur propre à chaque rando au lieu du
   rouge uniforme. Les tronçons partagés par plusieurs randos s'écartent légèrement pour rester lisibles,
-  un peu comme des lignes de métro qui se
-  longent sans se superposer.
+  un peu comme des lignes de métro qui se longent sans se superposer.
 - Le sélecteur de calques (haut à droite) propose un fond **Relief** avec courbes de niveau et estompage,
   en plus d'OpenStreetMap et IGN.
 
