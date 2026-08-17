@@ -9,7 +9,7 @@ const COLOR_EDITING = "#2980b9";  // rando en cours de modification / création
 // Bumped by hand on every change, shown in the sidebar footer — GitHub Pages can take a minute to
 // actually serve a new push, and the browser can also just be showing a cached copy, so this is
 // the one reliable way to confirm you're testing the version you think you're testing.
-const APP_VERSION = "v35 · 2026-08-17";
+const APP_VERSION = "v36 · 2026-08-17";
 document.getElementById("app-version").textContent = APP_VERSION;
 
 let leafletMap;
@@ -1003,10 +1003,10 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
             const dot = tLat * qLat + tLng * qLng;
             if (Math.abs(dot) < CROSS_HIKE_MIN_PARALLEL_DOT) continue; // crossing at an angle, not running alongside
             const matchedIndex = haversineMeters([lat, lng], a) <= haversineMeters([lat, lng], b) ? ia : ib;
-            bestByPartner.set(q.hikeId, { dist: segDist, matchedIndex, sign: dot >= 0 ? 1 : -1 });
+            bestByPartner.set(q.hikeId, { dist: segDist, matchedIndex, sign: dot >= 0 ? 1 : -1, confidence: Math.abs(dot) });
           }
         });
-        bestByPartner.forEach(({ matchedIndex, sign }, partnerId) => otherInfo[h.id][i].set(partnerId, { matchedIndex, sign }));
+        bestByPartner.forEach(({ matchedIndex, sign, confidence }, partnerId) => otherInfo[h.id][i].set(partnerId, { matchedIndex, sign, confidence }));
       });
     });
   }
@@ -1129,6 +1129,16 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
     parent[rx] = ry;
     parityToParent[rx] = sign * px * py;
   }
+  // Every relationship is collected into a single list FIRST, then processed in order of
+  // CONFIDENCE (most certain first) rather than in whatever order the hikes/points happen to
+  // iterate in. This matters because union() silently keeps whichever relationship got
+  // established first whenever a later edge disagrees with one already implied by the component
+  // it would join — on real, noisy GPS/routed data a single borderline edge (e.g. a tangent
+  // estimate right at the edge of the parallel-direction threshold) can, if processed early,
+  // wrongly orient an entire long shared stretch; processing the clearest, most obviously-correct
+  // relationships first means a later noisy edge is the one far more likely to be the one silently
+  // dropped instead, exactly the outcome that's actually wanted.
+  const edges = [];
   // Same-hike edges: point i agrees or disagrees with point i-1 depending on whether their
   // (already smoothed) tangents point the same general way — this is what keeps the direction
   // rotating smoothly through a hairpin instead of flipping. Only linked where at least one of
@@ -1144,8 +1154,8 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
     const raw = rawLaneOffsets[h.id];
     for (let i = 1; i < tangents.length; i++) {
       if (raw[i - 1] === 0 && raw[i] === 0) continue;
-      const sign = tangents[i - 1].tLat * tangents[i].tLat + tangents[i - 1].tLng * tangents[i].tLng >= 0 ? 1 : -1;
-      union(nodeOf(h.id, i - 1), nodeOf(h.id, i), sign);
+      const dot = tangents[i - 1].tLat * tangents[i].tLat + tangents[i - 1].tLng * tangents[i].tLng;
+      edges.push({ a: nodeOf(h.id, i - 1), b: nodeOf(h.id, i), sign: dot >= 0 ? 1 : -1, confidence: Math.abs(dot) });
     }
   });
   // Cross-hike edges: point i of h agrees or disagrees with the matched point on each confirmed
@@ -1153,8 +1163,8 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
   // hikes (however each was individually recorded) agreeing on the same side.
   hikeList.forEach((h) => {
     filteredOtherInfo[h.id].forEach((partners, i) => {
-      partners.forEach(({ matchedIndex, sign }, partnerId) => {
-        union(nodeOf(h.id, i), nodeOf(partnerId, matchedIndex), sign);
+      partners.forEach(({ matchedIndex, sign, confidence }, partnerId) => {
+        edges.push({ a: nodeOf(h.id, i), b: nodeOf(partnerId, matchedIndex), sign, confidence });
       });
     });
   });
@@ -1170,10 +1180,12 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
       if (!matched) return;
       const j = selfMatchIndex[h.id][i];
       const tI = smoothedTangentByHike[h.id][i], tJ = smoothedTangentByHike[h.id][j];
-      const sign = tI.tLat * tJ.tLat + tI.tLng * tJ.tLng >= 0 ? 1 : -1;
-      union(nodeOf(h.id, i), nodeOf(h.id, j), sign);
+      const dot = tI.tLat * tJ.tLat + tI.tLng * tJ.tLng;
+      edges.push({ a: nodeOf(h.id, i), b: nodeOf(h.id, j), sign: dot >= 0 ? 1 : -1, confidence: Math.abs(dot) });
     });
   });
+  edges.sort((p, q) => q.confidence - p.confidence);
+  edges.forEach(({ a, b, sign }) => union(a, b, sign));
   // Final canonical tangent for a point: its sign relative to its component's root, times a
   // reasonable default orientation picked for that root (northward-leaning, purely cosmetic —
   // any consistent choice works equally well since every OTHER node in the component is defined
