@@ -9,7 +9,7 @@ const COLOR_EDITING = "#2980b9";  // rando en cours de modification / création
 // Bumped by hand on every change, shown in the sidebar footer — GitHub Pages can take a minute to
 // actually serve a new push, and the browser can also just be showing a cached copy, so this is
 // the one reliable way to confirm you're testing the version you think you're testing.
-const APP_VERSION = "v30 · 2026-08-17";
+const APP_VERSION = "v31 · 2026-08-17";
 document.getElementById("app-version").textContent = APP_VERSION;
 
 let leafletMap;
@@ -1027,14 +1027,61 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
 
   // Smooth the lane offset along each hike's own sequence so it eases in and out gradually
   // instead of snapping between sides.
+  const TANGENT_SMOOTH_WINDOW_M = 20;    // real-distance window for the DIRECTION smoothing below
   const clusters = {};
   hikeList.forEach((h) => {
     const raw = rawLaneOffsets[h.id];
     const coords = h.coordinates;
+    const cumDist = cumDistByHike[h.id];
     // Raw per-point tangents, precomputed once so the window sum below is cheap — used ONLY to
     // pick which side of the trail this hike's offset nudges to, never for detection (self-merge
     // still uses the sharp, un-smoothed tangentAt directly, see above).
     const rawTangents = coords.map((_, i) => tangentAt(coords, i));
+
+    // Real-distance-smoothed tangent + its "coherence" (how consistent the raw tangents inside
+    // the window actually are — opposite-direction tangents cancel each other out, so a genuine
+    // hairpin reads as low coherence) at every point, computed once up front so the sequential
+    // pass below can stay cheap.
+    const smoothedTangent = coords.map((_, i) => {
+      const here = cumDist[i];
+      let ta = i;
+      while (ta > 0 && (ta === i || here - cumDist[ta] < TANGENT_SMOOTH_WINDOW_M)) ta--;
+      let tb = i;
+      while (tb < coords.length - 1 && (tb === i || cumDist[tb] - here < TANGENT_SMOOTH_WINDOW_M)) tb++;
+      let sumTLat = 0, sumTLng = 0;
+      for (let j = ta; j <= tb; j++) { sumTLat += rawTangents[j][0]; sumTLng += rawTangents[j][1]; }
+      const tLen = Math.hypot(sumTLat, sumTLng) || 1;
+      return { tLat: sumTLat / tLen, tLng: sumTLng / tLen, coherence: Math.hypot(sumTLat, sumTLng) / (tb - ta + 1) };
+    });
+
+    // Turn that smoothed tangent into a CONSISTENT perpendicular reference by walking the hike in
+    // order and, at each point, keeping whichever of the two opposite unit directions is CLOSER TO
+    // THE PREVIOUS POINT's choice — rather than re-deciding independently at every point against a
+    // fixed external axis (e.g. "always point roughly north"). A fixed per-point axis is what
+    // caused the direction to visibly snap across right at a switchback's hairpin apex: the
+    // smoothed tangent sweeps continuously through every compass direction over a ~180° turn, so
+    // it's guaranteed to cross whatever fixed axis the threshold uses at some point during that
+    // sweep, and that crossing forces an instant flip — a tightly-sampled real hairpin compresses
+    // the whole sweep into just one or two points, so the two tracks visibly touch/cross exactly
+    // there. Propagating from the immediately preceding point instead means the chosen direction
+    // just keeps rotating smoothly through the turn, the same way the underlying geometry does,
+    // with no point ever disagreeing with its neighbor. Seeded with the old fixed-axis rule only
+    // at the very first point (i=0) — from there on, continuity does the work. Two hikes on the
+    // SAME physical trail recorded in opposite walking directions (explicitly treated as "the same
+    // trail" by the direction check above via Math.abs) still end up agreeing on the same
+    // orientation once propagation has had a chance to settle, since it's their shared GEOMETRY
+    // driving the choice, not each one's own arbitrary starting point.
+    let prevCanon = null;
+    const canonTangent = smoothedTangent.map(({ tLat, tLng }) => {
+      if (prevCanon === null) {
+        if (tLat < 0 || (tLat === 0 && tLng < 0)) { tLat = -tLat; tLng = -tLng; }
+      } else if (tLat * prevCanon[0] + tLng * prevCanon[1] < 0) {
+        tLat = -tLat; tLng = -tLng;
+      }
+      prevCanon = [tLat, tLng];
+      return prevCanon;
+    });
+
     clusters[h.id] = raw.map((_, i) => {
       const start = Math.max(0, i - OVERLAP_SMOOTH_WINDOW);
       const end = Math.min(raw.length, i + OVERLAP_SMOOTH_WINDOW + 1);
@@ -1060,39 +1107,13 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
       const selfSnapToIndex = matchedIdx !== -1 && i > matchedIdx ? matchedIdx : null;
       if (Math.abs(laneOffset) < 0.05 && selfSnapToIndex === null) return null;
 
-      // The offset direction is "perpendicular to the trail here" — but a plain per-point tangent
-      // reverses ~180° at a switchback apex (the trail itself reverses direction there), which
-      // flips which side the offset lands on from one point to the next: two hikes lacing through
-      // the very same switchback together would see the gap between them snap from one side to
-      // the other at every hairpin, an ugly, jarring jump on top of an otherwise clean separation.
-      // Average the raw tangent over the same window as the lane offset above (not a fixed
-      // real-distance window like crossTangentAt — this only needs to be smooth, not precise) so
-      // the direction eases through a reversal instead of snapping. Two opposite-direction
-      // tangents in the same window cancel out, which is also exactly the "coherence" of the
-      // direction there — apply that as a multiplier on the lane offset too, so the offset PINCHES
-      // BACK toward the trail line right at a genuine hairpin (where "which side" is momentarily
-      // ambiguous) instead of holding full magnitude while flipping sides.
-      let sumTLat = 0, sumTLng = 0;
-      for (let j = start; j < end; j++) { sumTLat += rawTangents[j][0]; sumTLng += rawTangents[j][1]; }
-      const coherence = Math.hypot(sumTLat, sumTLng) / (end - start);
-      const tLen = Math.hypot(sumTLat, sumTLng) || 1;
-      let [tLat, tLng] = [sumTLat / tLen, sumTLng / tLen];
-      // Floored at 0.7: a genuine hairpin still gets tapered (softening the direction flip) but
-      // can never lose more than 30% of its magnitude just because the trail curves — an uncapped
-      // multiplier was crushing the offset toward invisible on any real, moderately winding trail,
-      // not just at sharp switchback apexes.
-      const coherenceFactor = Math.max(coherence, 0.7);
-      // Canonicalize the tangent's sign before deriving the perpendicular: two hikes on the SAME
-      // physical trail can be recorded in opposite walking directions (one went up, the other came
-      // down — the direction check above explicitly treats that as "the same trail" via Math.abs),
-      // which gives them exactly opposite tangents. Combined with the opposite lane sign a hike on
-      // one side of the sorted cluster gets vs. the other, an opposite tangent flips the
-      // perpendicular too, and the two flips CANCEL — both hikes end up nudged the same way
-      // instead of apart (confirmed on a real reversed-recording pair: both landed ~7m further
-      // north instead of splitting to either side). Always picking the "northward-leaning" version
-      // of the tangent (or eastward, on an exact east-west trail) makes both hikes agree on the
-      // same reference orientation regardless of which one was walked backwards.
-      if (tLat < 0 || (tLat === 0 && tLng < 0)) { tLat = -tLat; tLng = -tLng; }
+      // Floored at 0.7: a genuine hairpin still tapers the offset a little (softening whatever
+      // residual direction change is left even after the continuity fix above) but can never lose
+      // more than 30% of its magnitude just because the trail curves — an uncapped multiplier was
+      // crushing the offset toward invisible on any real, moderately winding trail, not just at
+      // sharp switchback apexes.
+      const coherenceFactor = Math.max(smoothedTangent[i].coherence, 0.7);
+      const [tLat, tLng] = canonTangent[i];
       return { laneOffset: laneOffset * coherenceFactor, selfSnapToIndex, perpLat: -tLng, perpLng: tLat };
     });
   });
