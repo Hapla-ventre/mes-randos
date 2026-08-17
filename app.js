@@ -9,7 +9,7 @@ const COLOR_EDITING = "#2980b9";  // rando en cours de modification / création
 // Bumped by hand on every change, shown in the sidebar footer — GitHub Pages can take a minute to
 // actually serve a new push, and the browser can also just be showing a cached copy, so this is
 // the one reliable way to confirm you're testing the version you think you're testing.
-const APP_VERSION = "v24 · 2026-08-17";
+const APP_VERSION = "v25 · 2026-08-17";
 document.getElementById("app-version").textContent = APP_VERSION;
 
 let leafletMap;
@@ -765,6 +765,33 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
     return [dLat / len, dLng / len];
   }
 
+  // A distance-windowed tangent, used ONLY for the cross-hike "am I walking roughly the same way
+  // as the other hike" direction check below — NOT for self-merge, which needs the sharp,
+  // un-smoothed tangentAt above to tell a real retrace apart from a switchback leg (smoothing that
+  // one out was tried and broke exactly that distinction). The plain one-point tangentAt is noisy
+  // right at a hike's very first/last points specifically: ORS often snaps the route start onto the
+  // nearest path via a short "access" segment that can point in a meaningfully different direction
+  // than the trail itself for the first few meters. Confirmed against real saved hikes: one pair's
+  // cross-hike dot climbed 0.37 → 0.46 → 0.57 over its first three points — just under the 0.6
+  // threshold each time — even though moments later it's genuinely walking alongside the other
+  // hike. Averaging over a short real-distance window smooths that initial noise out without
+  // blurring real trail geometry the way a longer window would.
+  const CROSS_TANGENT_WINDOW_M = 12;
+  function crossTangentAt(coords, cumDist, i) {
+    const here = cumDist[i];
+    // Always steps at least one point each way (like the plain tangentAt) even when that single
+    // step already exceeds the window — on a sparse stretch the immediate neighbor IS the best
+    // available estimate; only extend further when there's denser data to smooth over.
+    let a = i;
+    while (a > 0 && (a === i || here - cumDist[a] < CROSS_TANGENT_WINDOW_M)) a--;
+    let b = i;
+    while (b < coords.length - 1 && (b === i || cumDist[b] - here < CROSS_TANGENT_WINDOW_M)) b++;
+    const prev = coords[a], next = coords[b];
+    const dLat = next[0] - prev[0], dLng = next[1] - prev[1];
+    const len = Math.hypot(dLat, dLng) || 1;
+    return [dLat / len, dLng / len];
+  }
+
   // Cumulative real-world distance along each hike's own point list — the common ingredient every
   // "how far along the trail" check below needs, computed once per hike up front.
   const cumDistByHike = {};
@@ -937,8 +964,9 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
   hikeList.forEach((h) => { otherSets[h.id] = h.coordinates.map(() => new Set()); });
   if (includeOtherHikes) {
     hikeList.forEach((h) => {
+      const cumDist = cumDistByHike[h.id];
       h.coordinates.forEach(([lat, lng], i) => {
-        const [tLat, tLng] = tangentAt(h.coordinates, i);
+        const [tLat, tLng] = crossTangentAt(h.coordinates, cumDist, i);
         neighborsOf(lat, lng).forEach((q) => {
           if (q.hikeId === h.id) return;
           const otherCoords = hikeById.get(q.hikeId).coordinates;
