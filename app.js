@@ -9,7 +9,7 @@ const COLOR_EDITING = "#2980b9";  // rando en cours de modification / création
 // Bumped by hand on every change, shown in the sidebar footer — GitHub Pages can take a minute to
 // actually serve a new push, and the browser can also just be showing a cached copy, so this is
 // the one reliable way to confirm you're testing the version you think you're testing.
-const APP_VERSION = "v21 · 2026-08-17";
+const APP_VERSION = "v22 · 2026-08-17";
 document.getElementById("app-version").textContent = APP_VERSION;
 
 let leafletMap;
@@ -686,9 +686,14 @@ const OVERLAP_THRESHOLD_M = 28;        // cross-hike (different randos) separati
 const SELF_OVERLAP_THRESHOLD_M = 35;   // self-merge (same rando's own out-and-back) — a bit more generous, safe because the direction check (see SELF_OPPOSITE_MAX_DOT below) is what actually guards against false positives, not this number
 const SELF_OPPOSITE_MAX_DOT = -0.3;    // the two candidate points' local travel directions, as unit vectors, must dot to below this to count as "opposite ways" (-1 = exact U-turn, 0 = perpendicular, +1 = same direction) — this is what tells a real retrace apart from a switchback leg merely passing nearby
 const OVERLAP_SMOOTH_WINDOW = 8;       // points of smoothing on the cross-hike offset, so it ramps in/out instead of snapping side to side
-const OVERLAP_MIN_RUN_POINTS = 6;      // require a sustained run before treating two paths as "running together" — a brief crossing at an angle shouldn't trigger anything
-const OVERLAP_MIN_SELF_INDEX_GAP = 15; // how many points apart in the SAME hike's own point list before two nearby points can even be considered a separate pass (otherwise every bend in the trail would "match itself")
-const BRIDGE_MAX_GAP_POINTS = 30;      // bridges short dropouts (a few points where the distance/direction check briefly fails) between two confirmed self-merge runs, so a clearly-shared corridor doesn't flicker on and off
+// Routed geometry from ORS is wildly uneven in point density — a bend can have a point every
+// couple of meters while a long straight stretch might only have one point every 50-100m. Every
+// "how long is this run / how far apart are these two points" question below is answered in real
+// METERS along the trail, not point counts, so the same rule behaves consistently whether a given
+// stretch happens to be point-dense or point-sparse in the routed data.
+const OVERLAP_MIN_RUN_METERS = 30;     // require a sustained run before treating two paths as "running together" — a brief crossing at an angle shouldn't trigger anything
+const MIN_SELF_INDEX_GAP_METERS = 40;  // how far apart ALONG THE TRAIL two points of the same hike must be before they can even be considered a separate pass (otherwise every bend would "match itself")
+const BRIDGE_MAX_GAP_METERS = 60;      // bridges short dropouts (a stretch where the distance/direction check briefly fails) between two confirmed self-merge runs, so a clearly-shared corridor doesn't flicker on and off
 
 // The expensive step: for every point of every hike, find every OTHER point within threshold —
 // from a different hike (if includeOtherHikes), or a distant point of the SAME hike retracing its
@@ -696,6 +701,7 @@ const BRIDGE_MAX_GAP_POINTS = 30;      // bridges short dropouts (a few points w
 // instead of comparing every pair. Doesn't depend on zoom, so it's cached by the caller and only
 // rebuilt when the hikes (or this flag) actually change.
 function buildOverlapClusters(hikeList, includeOtherHikes) {
+  const hikeById = new Map(hikeList.map((h) => [h.id, h]));
   const cellIndex = new Map();
   // Sized to the LARGER of the two thresholds so the ±1-cell neighbor scan below reliably reaches
   // that far regardless of which check (self or cross-hike) is running.
@@ -735,17 +741,29 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
     return [dLat / len, dLng / len];
   }
 
+  // Cumulative real-world distance along each hike's own point list — the common ingredient every
+  // "how far along the trail" check below needs, computed once per hike up front.
+  const cumDistByHike = {};
+  hikeList.forEach((h) => {
+    const cum = [0];
+    for (let i = 1; i < h.coordinates.length; i++) cum.push(cum[i - 1] + haversineMeters(h.coordinates[i - 1], h.coordinates[i]));
+    cumDistByHike[h.id] = cum;
+  });
+
   // Require a sustained run before treating two paths as "running together" (used for both self
   // and cross-hike) — a couple of trails merely crossing at an angle, or a route just grazing its
-  // own earlier path once, only satisfy the distance+direction check for a point or two.
-  function filterRuns(n, presentAt) {
+  // own earlier path once, only satisfy the distance+direction check for a point or two. Measured
+  // in real trail distance (via cumDist), not point count — a run can be as few as 2 points on a
+  // sparse straight stretch and still be a long, genuine overlap.
+  function filterRuns(cumDist, presentAt, minMeters) {
+    const n = cumDist.length;
     const filtered = new Array(n).fill(false);
     let runStart = -1;
     for (let i = 0; i <= n; i++) {
       const present = i < n && presentAt(i);
       if (present && runStart === -1) runStart = i;
       if (!present && runStart !== -1) {
-        if (i - runStart >= OVERLAP_MIN_RUN_POINTS) {
+        if (cumDist[i - 1] - cumDist[runStart] >= minMeters) {
           for (let j = runStart; j < i; j++) filtered[j] = true;
         }
         runStart = -1;
@@ -767,12 +785,13 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
   const selfMatchIndex = {}; // hikeId -> per-point index it re-meets its own path at, or -1
   hikeList.forEach((h) => { selfMatchIndex[h.id] = new Array(h.coordinates.length).fill(-1); });
   hikeList.forEach((h) => {
+    const cumDist = cumDistByHike[h.id];
     h.coordinates.forEach(([lat, lng], i) => {
       const [tLat, tLng] = tangentAt(h.coordinates, i);
       let bestDist = Infinity;
       neighborsOf(lat, lng).forEach((q) => {
         if (q.hikeId !== h.id) return;
-        if (Math.abs(q.i - i) < OVERLAP_MIN_SELF_INDEX_GAP) return;
+        if (Math.abs(cumDist[q.i] - cumDist[i]) < MIN_SELF_INDEX_GAP_METERS) return;
         const d = haversineMeters([lat, lng], [q.lat, q.lng]);
         if (d >= SELF_OVERLAP_THRESHOLD_M || d >= bestDist) return;
         const [qLat, qLng] = tangentAt(h.coordinates, q.i);
@@ -824,7 +843,7 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
 
   const filteredSelf = {};
   hikeList.forEach((h) => {
-    filteredSelf[h.id] = filterRuns(h.coordinates.length, (i) => selfCandidateIndex[h.id].has(i));
+    filteredSelf[h.id] = filterRuns(cumDistByHike[h.id], (i) => selfCandidateIndex[h.id].has(i), OVERLAP_MIN_RUN_METERS);
   });
 
   // The nearest-match choice can still drift a point or two off the "true" mirror index from one
@@ -857,14 +876,14 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
   // sides of the gap to roughly agree — without that, this would happily reconnect two runs the
   // pivot check just separated for being genuinely different retraces (e.g. two different
   // switchback leg-pairs sitting only a few points apart), undoing that check entirely.
-  function bridgeSelfGaps(filtered, matchIndex) {
+  function bridgeSelfGaps(filtered, matchIndex, cumDist) {
     const n = filtered.length;
     let i = 0;
     while (i < n) {
       if (filtered[i]) { i++; continue; }
       let j = i;
       while (j < n && !filtered[j]) j++;
-      if (i > 0 && j < n && filtered[i - 1] && filtered[j] && (j - i) <= BRIDGE_MAX_GAP_POINTS) {
+      if (i > 0 && j < n && filtered[i - 1] && filtered[j] && (cumDist[j] - cumDist[i - 1]) <= BRIDGE_MAX_GAP_METERS) {
         const startVal = matchIndex[i - 1], endVal = matchIndex[j];
         const pivotStart = (i - 1) + startVal, pivotEnd = j + endVal;
         if (Math.abs(pivotStart - pivotEnd) <= PIVOT_DRIFT_TOLERANCE) {
@@ -877,19 +896,31 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
       i = j;
     }
   }
-  hikeList.forEach((h) => { bridgeSelfGaps(filteredSelf[h.id], selfMatchIndex[h.id]); });
+  hikeList.forEach((h) => { bridgeSelfGaps(filteredSelf[h.id], selfMatchIndex[h.id], cumDistByHike[h.id]); });
 
   // ----- 2. Cross-hike overlap detection -----
   // Which OTHER hikes are within threshold at each point — kept per-partner, not summed yet, so
-  // the run-length filter can be applied per pair.
+  // the run-length filter can be applied per pair. Distance alone isn't enough here either: two
+  // trails simply crossing at an angle (an X-junction) are unavoidably within threshold for a
+  // stretch of their own — at OVERLAP_THRESHOLD_M=28m, even a right-angle crossing has ~50m of
+  // "close enough" on each side of the actual junction, and a shallow-angle crossing can stretch
+  // that to hundreds of meters, comfortably beating any reasonable minimum-run-length check. What
+  // actually marks two hikes as "running together" rather than "crossing" is DIRECTION: their local
+  // tangents must be roughly parallel or anti-parallel (the same trail walked either way), not at a
+  // real angle to each other — the same principle as the self-merge direction check above.
+  const CROSS_HIKE_MIN_PARALLEL_DOT = 0.6;
   const otherSets = {};
   hikeList.forEach((h) => { otherSets[h.id] = h.coordinates.map(() => new Set()); });
   if (includeOtherHikes) {
     hikeList.forEach((h) => {
       h.coordinates.forEach(([lat, lng], i) => {
+        const [tLat, tLng] = tangentAt(h.coordinates, i);
         neighborsOf(lat, lng).forEach((q) => {
           if (q.hikeId === h.id) return;
-          if (haversineMeters([lat, lng], [q.lat, q.lng]) < OVERLAP_THRESHOLD_M) otherSets[h.id][i].add(q.hikeId);
+          if (haversineMeters([lat, lng], [q.lat, q.lng]) >= OVERLAP_THRESHOLD_M) return;
+          const [qLat, qLng] = tangentAt(hikeById.get(q.hikeId).coordinates, q.i);
+          if (Math.abs(tLat * qLat + tLng * qLng) < CROSS_HIKE_MIN_PARALLEL_DOT) return; // crossing at an angle, not running alongside
+          otherSets[h.id][i].add(q.hikeId);
         });
       });
     });
@@ -897,12 +928,12 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
   const filteredOtherSets = {};
   hikeList.forEach((h) => {
     const raw = otherSets[h.id];
-    const n = raw.length;
+    const cumDist = cumDistByHike[h.id];
     const filtered = raw.map(() => new Set());
     const partners = new Set();
     raw.forEach((s) => s.forEach((id) => partners.add(id)));
     partners.forEach((otherId) => {
-      filterRuns(n, (i) => raw[i].has(otherId)).forEach((keep, i) => { if (keep) filtered[i].add(otherId); });
+      filterRuns(cumDist, (i) => raw[i].has(otherId), OVERLAP_MIN_RUN_METERS).forEach((keep, i) => { if (keep) filtered[i].add(otherId); });
     });
     filteredOtherSets[h.id] = filtered;
   });

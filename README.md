@@ -116,7 +116,13 @@ Le site se met à jour automatiquement en ~1 minute (GitHub Pages).
 - Fond de carte IGN disponible via le même sélecteur (plus lisible pour la rando en France).
 - L'écartement "métro" des randos superposées est une approximation par proximité de points (pas une vraie
   détection de tronçons partagés comme le ferait un logiciel de plan de transport) — largement suffisant
-  pour distinguer tes randos, mais pas géométriquement parfait sur des croisements complexes.
+  pour distinguer tes randos, mais pas géométriquement parfait sur des croisements complexes. Toutes les
+  distances utilisées (proximité, longueur minimale d'un chevauchement) sont mesurées en mètres réels le
+  long du tracé, pas en nombre de points — un itinéraire routé a des points très serrés dans les virages
+  et très espacés en ligne droite, donc un seuil compté en points se comportait différemment selon
+  l'endroit. Deux randos qui se croisent simplement à angle (sans se longer) ne sont pas écartées : en
+  plus de la distance, leurs directions locales doivent être à peu près parallèles (ou opposées, pour
+  une même rando enregistrée en sens inverse par deux personnes différentes).
 - L'aller et le retour d'une même rando sont fusionnés en un seul trait plutôt qu'écartés (même
   couleur, rien à distinguer). Pour ne pas confondre un vrai aller-retour avec un chemin qui fait des
   lacets (proche de lui-même mais pas du tout le même trajet), la fusion exige un point proche
