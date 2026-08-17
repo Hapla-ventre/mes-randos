@@ -9,7 +9,7 @@ const COLOR_EDITING = "#2980b9";  // rando en cours de modification / création
 // Bumped by hand on every change, shown in the sidebar footer — GitHub Pages can take a minute to
 // actually serve a new push, and the browser can also just be showing a cached copy, so this is
 // the one reliable way to confirm you're testing the version you think you're testing.
-const APP_VERSION = "v20 · 2026-08-17";
+const APP_VERSION = "v21 · 2026-08-17";
 document.getElementById("app-version").textContent = APP_VERSION;
 
 let leafletMap;
@@ -933,9 +933,12 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
     for (let i = 0; i < id.length; i++) hash = (hash * 31 + id.charCodeAt(i)) >>> 0;
     return (hash % 15) / 1000; // 0 .. 0.014
   }
+  const floors = {};
+  hikeList.forEach((h) => { floors[h.id] = 0.3 + selfJitter(h.id); });
+
   const rawOtherRanks = {};
   hikeList.forEach((h) => {
-    const floor = 0.3 + selfJitter(h.id);
+    const floor = floors[h.id];
     rawOtherRanks[h.id] = h.coordinates.map((_, i) => {
       const partners = filteredOtherSets[h.id][i];
       if (partners.size === 0) return 0;
@@ -958,12 +961,25 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
   hikeList.forEach((h) => {
     const raw = rawOtherRanks[h.id];
     const coords = h.coordinates;
+    const floor = floors[h.id];
     clusters[h.id] = raw.map((_, i) => {
       const start = Math.max(0, i - OVERLAP_SMOOTH_WINDOW);
       const end = Math.min(raw.length, i + OVERLAP_SMOOTH_WINDOW + 1);
       let sum = 0;
       for (let j = start; j < end; j++) sum += raw[j];
-      const otherRank = sum / (end - start);
+      let otherRank = sum / (end - start);
+
+      // The floor above guarantees every RAW point has a comfortably nonzero value, but this
+      // averaging window can still wash it back down for a short overlap run: near the middle of
+      // a run only 6–16 points long, the ±8-point window reaches past both ends into the
+      // surrounding "no overlap" zeros, diluting the average right back toward 0 — reappearing as
+      // "no gap at all" exactly where two hikes visibly run together for a short stretch. Re-apply
+      // the same floor to the SMOOTHED result wherever this point is still within a confirmed
+      // overlap run, so dilution can soften the edges but can never erase the middle.
+      if (filteredOtherSets[h.id][i].size > 0 && Math.abs(otherRank) < floor) {
+        const sign = otherRank !== 0 ? Math.sign(otherRank) : (selfJitter(h.id) < 0.007 ? -1 : 1);
+        otherRank = sign * floor;
+      }
 
       // A LATER pass (i > matchedIdx) meeting its own earlier pass gets marked to snap onto it —
       // see applyOverlapClusters. The earlier pass itself is left alone (it's the reference the
