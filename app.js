@@ -9,7 +9,7 @@ const COLOR_EDITING = "#2980b9";  // rando en cours de modification / création
 // Bumped by hand on every change, shown in the sidebar footer — GitHub Pages can take a minute to
 // actually serve a new push, and the browser can also just be showing a cached copy, so this is
 // the one reliable way to confirm you're testing the version you think you're testing.
-const APP_VERSION = "v29 · 2026-08-17";
+const APP_VERSION = "v30 · 2026-08-17";
 document.getElementById("app-version").textContent = APP_VERSION;
 
 let leafletMap;
@@ -1002,61 +1002,35 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
     filteredOtherSets[h.id] = filtered;
   });
 
-  // Each hike gets nudged away from every coincident OTHER hike independently: a fixed magnitude
-  // per pair (not per point), so a partner entering or leaving range only ever changes the total
-  // gradually — no ordinal "who's nearby right now" ranking that could jump around as company
-  // changes along the path. Two refinements on top of a plain fixed ±0.5 per partner:
-  //  - each PAIR gets its own magnitude (0.40–0.60, derived from the pair's ids) instead of every
-  //    pair using the exact same 0.5 — at a busy junction where several hikes converge, identical
-  //    magnitudes let two DIFFERENT hikes' sums coincidentally land on the exact same total (one
-  //    would render on top of the other and disappear); distinct per-pair magnitudes make that
-  //    astronomically unlikely.
-  //  - the total is floored away from 0 (by a small per-HIKE amount, so two hikes floored at the
-  //    same point still land on different floors) whenever a hike has at least one partner — a sum
-  //    of several ± terms can otherwise land close to 0 by pure chance even though no individual
-  //    term is small, which reads as "no separation at all" right where it's needed most. A single
-  //    partner alone is always ≥0.40, well clear of the floor, so the ordinary 2-hike case is
-  //    completely unaffected.
-  function pairMagnitude(idA, idB) {
-    const key = idA < idB ? idA + "|" + idB : idB + "|" + idA;
-    let hash = 0;
-    for (let i = 0; i < key.length; i++) hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
-    return 0.4 + (hash % 21) / 100; // 0.40 .. 0.60
-  }
-  function selfJitter(id) {
-    let hash = 0;
-    for (let i = 0; i < id.length; i++) hash = (hash * 31 + id.charCodeAt(i)) >>> 0;
-    return (hash % 15) / 1000; // 0 .. 0.014
-  }
-  const floors = {};
-  hikeList.forEach((h) => { floors[h.id] = 0.3 + selfJitter(h.id); });
-
-  const rawOtherRanks = {};
+  // Each hike is assigned an ordinal LANE among every hike overlapping it at this exact point
+  // (itself + every currently active partner), sorted by id — not a sum of independent pairwise
+  // magnitudes like before. Summing independent pairwise magnitudes gave whichever hike sorts
+  // first or last among its partners the FULL combined magnitude of all of them (every comparison
+  // points the same way for an id at one end of the sort order), while a hike in the middle of the
+  // sort order got a mix of + and - terms that partly cancelled — so at a busy junction the two
+  // outer tracks ended up visibly further from their neighbor than the inner ones were from each
+  // other. Ordinal lanes are evenly spaced by construction instead: N hikes always land on
+  // -(N-1)/2 .. (N-1)/2 in half-integer steps, so every adjacent pair is exactly one lane-width
+  // apart no matter how many hikes are in the group or where this one falls in id order — and
+  // since a sorted position is always unique, there's no risk of two different hikes landing on
+  // the exact same lane the way two independent magnitude sums could coincidentally collide.
+  const rawLaneOffsets = {};
   hikeList.forEach((h) => {
-    const floor = floors[h.id];
-    rawOtherRanks[h.id] = h.coordinates.map((_, i) => {
+    rawLaneOffsets[h.id] = h.coordinates.map((_, i) => {
       const partners = filteredOtherSets[h.id][i];
       if (partners.size === 0) return 0;
-      let sum = 0;
-      partners.forEach((otherId) => {
-        const mag = pairMagnitude(h.id, otherId);
-        sum += h.id < otherId ? -mag : mag;
-      });
-      if (Math.abs(sum) < floor) {
-        const sign = sum !== 0 ? Math.sign(sum) : (selfJitter(h.id) < 0.007 ? -1 : 1);
-        sum = sign * floor;
-      }
-      return sum;
+      const clusterIds = [h.id, ...partners].sort();
+      const n = clusterIds.length;
+      return clusterIds.indexOf(h.id) - (n - 1) / 2;
     });
   });
 
-  // Smooth the cross-hike rank along each hike's own sequence so it eases in and out gradually
+  // Smooth the lane offset along each hike's own sequence so it eases in and out gradually
   // instead of snapping between sides.
   const clusters = {};
   hikeList.forEach((h) => {
-    const raw = rawOtherRanks[h.id];
+    const raw = rawLaneOffsets[h.id];
     const coords = h.coordinates;
-    const floor = floors[h.id];
     // Raw per-point tangents, precomputed once so the window sum below is cheap — used ONLY to
     // pick which side of the trail this hike's offset nudges to, never for detection (self-merge
     // still uses the sharp, un-smoothed tangentAt directly, see above).
@@ -1066,18 +1040,17 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
       const end = Math.min(raw.length, i + OVERLAP_SMOOTH_WINDOW + 1);
       let sum = 0;
       for (let j = start; j < end; j++) sum += raw[j];
-      let otherRank = sum / (end - start);
+      let laneOffset = sum / (end - start);
 
-      // The floor above guarantees every RAW point has a comfortably nonzero value, but this
-      // averaging window can still wash it back down for a short overlap run: near the middle of
-      // a run only 6–16 points long, the ±8-point window reaches past both ends into the
-      // surrounding "no overlap" zeros, diluting the average right back toward 0 — reappearing as
-      // "no gap at all" exactly where two hikes visibly run together for a short stretch. Re-apply
-      // the same floor to the SMOOTHED result wherever this point is still within a confirmed
-      // overlap run, so dilution can soften the edges but can never erase the middle.
-      if (filteredOtherSets[h.id][i].size > 0 && Math.abs(otherRank) < floor) {
-        const sign = otherRank !== 0 ? Math.sign(otherRank) : (selfJitter(h.id) < 0.007 ? -1 : 1);
-        otherRank = sign * floor;
+      // The averaging window can wash a short run's lane offset back down toward 0 near its own
+      // edges (it reaches past the run into the surrounding "no overlap" zeros) — re-assert at
+      // least half of the RAW lane offset at this exact point whenever smoothing diluted it below
+      // that, so dilution can soften the edges but can't erase the middle of a short run. Guarded
+      // on raw[i] itself being nonzero: a hike that's exactly the middle lane of an odd-sized
+      // group (e.g. rank 0 of -1, 0, +1) is SUPPOSED to sit right on the trail line — that's not
+      // dilution, and re-flooring it would shove it sideways for no reason.
+      if (raw[i] !== 0 && Math.abs(laneOffset) < Math.abs(raw[i]) / 2) {
+        laneOffset = Math.sign(raw[i]) * Math.abs(raw[i]) / 2;
       }
 
       // A LATER pass (i > matchedIdx) meeting its own earlier pass gets marked to snap onto it —
@@ -1085,20 +1058,20 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
       // later one moves to), so this only ever applies to one side of a self-merge pair.
       const matchedIdx = filteredSelf[h.id][i] ? selfMatchIndex[h.id][i] : -1;
       const selfSnapToIndex = matchedIdx !== -1 && i > matchedIdx ? matchedIdx : null;
-      if (Math.abs(otherRank) < 0.05 && selfSnapToIndex === null) return null;
+      if (Math.abs(laneOffset) < 0.05 && selfSnapToIndex === null) return null;
 
       // The offset direction is "perpendicular to the trail here" — but a plain per-point tangent
       // reverses ~180° at a switchback apex (the trail itself reverses direction there), which
       // flips which side the offset lands on from one point to the next: two hikes lacing through
       // the very same switchback together would see the gap between them snap from one side to
       // the other at every hairpin, an ugly, jarring jump on top of an otherwise clean separation.
-      // Average the raw tangent over the same window as otherRank above (not a fixed real-distance
-      // window like crossTangentAt — this only needs to be smooth, not precise) so the direction
-      // eases through a reversal instead of snapping. Two opposite-direction tangents in the same
-      // window cancel out, which is also exactly the "coherence" of the direction there — apply
-      // that as a multiplier on otherRank too, so the offset PINCHES BACK toward the trail line
-      // right at a genuine hairpin (where "which side" is momentarily ambiguous) instead of holding
-      // full magnitude while flipping sides.
+      // Average the raw tangent over the same window as the lane offset above (not a fixed
+      // real-distance window like crossTangentAt — this only needs to be smooth, not precise) so
+      // the direction eases through a reversal instead of snapping. Two opposite-direction
+      // tangents in the same window cancel out, which is also exactly the "coherence" of the
+      // direction there — apply that as a multiplier on the lane offset too, so the offset PINCHES
+      // BACK toward the trail line right at a genuine hairpin (where "which side" is momentarily
+      // ambiguous) instead of holding full magnitude while flipping sides.
       let sumTLat = 0, sumTLng = 0;
       for (let j = start; j < end; j++) { sumTLat += rawTangents[j][0]; sumTLng += rawTangents[j][1]; }
       const coherence = Math.hypot(sumTLat, sumTLng) / (end - start);
@@ -1112,15 +1085,15 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
       // Canonicalize the tangent's sign before deriving the perpendicular: two hikes on the SAME
       // physical trail can be recorded in opposite walking directions (one went up, the other came
       // down — the direction check above explicitly treats that as "the same trail" via Math.abs),
-      // which gives them exactly opposite tangents. Combined with the opposite otherRank sign each
-      // gets from pairMagnitude (id-based, so also consistent either way), an opposite tangent
-      // flips the perpendicular too, and the two flips CANCEL — both hikes end up nudged the same
-      // way instead of apart (confirmed on a real reversed-recording pair: both landed ~7m further
+      // which gives them exactly opposite tangents. Combined with the opposite lane sign a hike on
+      // one side of the sorted cluster gets vs. the other, an opposite tangent flips the
+      // perpendicular too, and the two flips CANCEL — both hikes end up nudged the same way
+      // instead of apart (confirmed on a real reversed-recording pair: both landed ~7m further
       // north instead of splitting to either side). Always picking the "northward-leaning" version
       // of the tangent (or eastward, on an exact east-west trail) makes both hikes agree on the
       // same reference orientation regardless of which one was walked backwards.
       if (tLat < 0 || (tLat === 0 && tLng < 0)) { tLat = -tLat; tLng = -tLng; }
-      return { otherRank: otherRank * coherenceFactor, selfSnapToIndex, perpLat: -tLng, perpLng: tLat };
+      return { laneOffset: laneOffset * coherenceFactor, selfSnapToIndex, perpLat: -tLng, perpLng: tLat };
     });
   });
 
@@ -1146,18 +1119,13 @@ function applyOverlapClusters(hikeList, clusters, zoom) {
         [baseLat, baseLng] = h.coordinates[info.selfSnapToIndex];
         info = clusterInfo[info.selfSnapToIndex] || null;
       }
-      if (!info || !info.otherRank) return [baseLat, baseLng];
-      // otherRank is a SIGNED rank, not a magnitude of 1 — pairMagnitude keeps it in 0.40-0.60 per
-      // partner on purpose (see above), so "8px" here was never actually reaching 8px on screen.
-      // Measured directly against a real saved pair (rank ±0.45, the typical single-partner case):
-      // center-to-center came out to 7px — exactly the white halo's own width (haloWeight 7 on a
-      // default-state line), meaning the two halos touched edge-to-edge with zero visible gap.
-      // 15 puts that same typical case at ~13-14px center-to-center — enough margin beyond the
-      // halo to read clearly as two lines even on a real, imperfectly-clean overlap (12 measured
-      // too close to the halo edge once the direction-coherence damping above was added; 18 made
-      // every pair look overly spread out).
-      const offsetStepM = 15 * metersPerPixel(baseLat, zoom);
-      const offsetDeg = (info.otherRank * offsetStepM) / 111320;
+      if (!info || !info.laneOffset) return [baseLat, baseLng];
+      // laneOffset steps by exactly 1.0 between adjacent lanes (see buildOverlapClusters), so this
+      // constant IS directly the adjacent-lane pixel gap — no more guessing at how a 0.4-0.6
+      // magnitude range translates to screen pixels. Requested tight, barely-clearing the white
+      // halo (7-9px wide) rather than a wide dramatic split: 10px.
+      const offsetStepM = 10 * metersPerPixel(baseLat, zoom);
+      const offsetDeg = (info.laneOffset * offsetStepM) / 111320;
       return [baseLat + info.perpLat * offsetDeg, baseLng + info.perpLng * offsetDeg];
     });
   });
