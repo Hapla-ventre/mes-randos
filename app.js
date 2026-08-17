@@ -9,7 +9,7 @@ const COLOR_EDITING = "#2980b9";  // rando en cours de modification / création
 // Bumped by hand on every change, shown in the sidebar footer — GitHub Pages can take a minute to
 // actually serve a new push, and the browser can also just be showing a cached copy, so this is
 // the one reliable way to confirm you're testing the version you think you're testing.
-const APP_VERSION = "v22 · 2026-08-17";
+const APP_VERSION = "v23 · 2026-08-17";
 document.getElementById("app-version").textContent = APP_VERSION;
 
 let leafletMap;
@@ -731,16 +731,6 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
     return out;
   }
 
-  // The local direction of travel at point i, as a unit vector — used both to decide "opposite
-  // direction" for self-merge and as the perpendicular nudge direction for cross-hike separation.
-  function tangentAt(coords, i) {
-    const prev = coords[Math.max(0, i - 1)];
-    const next = coords[Math.min(coords.length - 1, i + 1)];
-    const dLat = next[0] - prev[0], dLng = next[1] - prev[1];
-    const len = Math.hypot(dLat, dLng) || 1;
-    return [dLat / len, dLng / len];
-  }
-
   // Cumulative real-world distance along each hike's own point list — the common ingredient every
   // "how far along the trail" check below needs, computed once per hike up front.
   const cumDistByHike = {};
@@ -749,6 +739,31 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
     for (let i = 1; i < h.coordinates.length; i++) cum.push(cum[i - 1] + haversineMeters(h.coordinates[i - 1], h.coordinates[i]));
     cumDistByHike[h.id] = cum;
   });
+
+  // The local direction of travel at point i, as a unit vector — used both to decide "opposite
+  // direction" for self-merge and, since the cross-hike direction check was added, to decide
+  // "running alongside" vs. "crossing at an angle" between two different hikes. That comparison
+  // needs the window to reach a comparable REAL distance on both sides — a fixed one-point
+  // before/after window doesn't: two independently-routed hikes can differ hugely in point density
+  // at the same physical spot (ORS packs points into curves and spaces them out on straights), so
+  // a fixed-index window gives one hike a noisy few-meter tangent and the other a smooth
+  // 50-100m-averaged one at the very same location — comparing those two is comparing noise to a
+  // trend, and the dot product can dip below the parallel threshold for no real geometric reason.
+  // Walking outward by real distance instead keeps both tangents comparably smoothed regardless of
+  // how densely either hike happened to be sampled there.
+  const TANGENT_WINDOW_M = 12;
+  function tangentAt(coords, cumDist, i) {
+    const here = cumDist[i];
+    let a = i;
+    while (a > 0 && here - cumDist[a - 1] < TANGENT_WINDOW_M) a--;
+    let b = i;
+    while (b < coords.length - 1 && cumDist[b + 1] - here < TANGENT_WINDOW_M) b++;
+    const prev = coords[a];
+    const next = coords[b];
+    const dLat = next[0] - prev[0], dLng = next[1] - prev[1];
+    const len = Math.hypot(dLat, dLng) || 1;
+    return [dLat / len, dLng / len];
+  }
 
   // Require a sustained run before treating two paths as "running together" (used for both self
   // and cross-hike) — a couple of trails merely crossing at an angle, or a route just grazing its
@@ -787,14 +802,14 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
   hikeList.forEach((h) => {
     const cumDist = cumDistByHike[h.id];
     h.coordinates.forEach(([lat, lng], i) => {
-      const [tLat, tLng] = tangentAt(h.coordinates, i);
+      const [tLat, tLng] = tangentAt(h.coordinates, cumDist, i);
       let bestDist = Infinity;
       neighborsOf(lat, lng).forEach((q) => {
         if (q.hikeId !== h.id) return;
         if (Math.abs(cumDist[q.i] - cumDist[i]) < MIN_SELF_INDEX_GAP_METERS) return;
         const d = haversineMeters([lat, lng], [q.lat, q.lng]);
         if (d >= SELF_OVERLAP_THRESHOLD_M || d >= bestDist) return;
-        const [qLat, qLng] = tangentAt(h.coordinates, q.i);
+        const [qLat, qLng] = tangentAt(h.coordinates, cumDist, q.i);
         if (tLat * qLat + tLng * qLng >= SELF_OPPOSITE_MAX_DOT) return; // not travelling opposite ways
         bestDist = d;
         selfMatchIndex[h.id][i] = q.i;
@@ -913,12 +928,14 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
   hikeList.forEach((h) => { otherSets[h.id] = h.coordinates.map(() => new Set()); });
   if (includeOtherHikes) {
     hikeList.forEach((h) => {
+      const cumDist = cumDistByHike[h.id];
       h.coordinates.forEach(([lat, lng], i) => {
-        const [tLat, tLng] = tangentAt(h.coordinates, i);
+        const [tLat, tLng] = tangentAt(h.coordinates, cumDist, i);
         neighborsOf(lat, lng).forEach((q) => {
           if (q.hikeId === h.id) return;
           if (haversineMeters([lat, lng], [q.lat, q.lng]) >= OVERLAP_THRESHOLD_M) return;
-          const [qLat, qLng] = tangentAt(hikeById.get(q.hikeId).coordinates, q.i);
+          const otherHike = hikeById.get(q.hikeId);
+          const [qLat, qLng] = tangentAt(otherHike.coordinates, cumDistByHike[otherHike.id], q.i);
           if (Math.abs(tLat * qLat + tLng * qLng) < CROSS_HIKE_MIN_PARALLEL_DOT) return; // crossing at an angle, not running alongside
           otherSets[h.id][i].add(q.hikeId);
         });
@@ -992,6 +1009,7 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
   hikeList.forEach((h) => {
     const raw = rawOtherRanks[h.id];
     const coords = h.coordinates;
+    const cumDist = cumDistByHike[h.id];
     const floor = floors[h.id];
     clusters[h.id] = raw.map((_, i) => {
       const start = Math.max(0, i - OVERLAP_SMOOTH_WINDOW);
@@ -1019,7 +1037,7 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
       const selfSnapToIndex = matchedIdx !== -1 && i > matchedIdx ? matchedIdx : null;
       if (Math.abs(otherRank) < 0.05 && selfSnapToIndex === null) return null;
 
-      const [tLat, tLng] = tangentAt(coords, i);
+      const [tLat, tLng] = tangentAt(coords, cumDist, i);
       return { otherRank, selfSnapToIndex, perpLat: -tLng, perpLng: tLat };
     });
   });
