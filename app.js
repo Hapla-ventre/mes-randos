@@ -9,7 +9,7 @@ const COLOR_EDITING = "#2980b9";  // rando en cours de modification / création
 // Bumped by hand on every change, shown in the sidebar footer — GitHub Pages can take a minute to
 // actually serve a new push, and the browser can also just be showing a cached copy, so this is
 // the one reliable way to confirm you're testing the version you think you're testing.
-const APP_VERSION = "v33 · 2026-08-17";
+const APP_VERSION = "v34 · 2026-08-17";
 document.getElementById("app-version").textContent = APP_VERSION;
 
 let leafletMap;
@@ -1187,11 +1187,13 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
       const selfSnapToIndex = matchedIdx !== -1 && i > matchedIdx ? matchedIdx : null;
       if (Math.abs(laneOffset) < 0.05 && selfSnapToIndex === null) return null;
 
-      // Floored at 0.7: a genuine hairpin still tapers the offset a little (softening whatever
-      // residual direction change is left) but can never lose more than 30% of its magnitude just
-      // because the trail curves — an uncapped multiplier was crushing the offset toward invisible
-      // on any real, moderately winding trail, not just at sharp switchback apexes.
-      const coherenceFactor = Math.max(smoothedTangentByHike[h.id][i].coherence, 0.7);
+      // Floored at 0.85: now that the union-find above resolves the actual direction correctly
+      // (no more jump/cross at a hairpin), this taper is barely needed anymore — it was originally
+      // floored much lower (0.7) as a safety cushion against the OLD per-point threshold flipping
+      // sides, which doesn't happen anymore. Kept small and high so a real hairpin still eases
+      // slightly rather than snapping to full width instantly, without visibly pinching the gap
+      // together the way the old, deeper floor did.
+      const coherenceFactor = Math.max(smoothedTangentByHike[h.id][i].coherence, 0.85);
       const [tLat, tLng] = canonicalTangentAt(h.id, i);
       return { laneOffset: laneOffset * coherenceFactor, selfSnapToIndex, perpLat: -tLng, perpLng: tLat };
     });
