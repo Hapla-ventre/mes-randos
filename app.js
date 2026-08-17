@@ -9,7 +9,7 @@ const COLOR_EDITING = "#2980b9";  // rando en cours de modification / création
 // Bumped by hand on every change, shown in the sidebar footer — GitHub Pages can take a minute to
 // actually serve a new push, and the browser can also just be showing a cached copy, so this is
 // the one reliable way to confirm you're testing the version you think you're testing.
-const APP_VERSION = "v25 · 2026-08-17";
+const APP_VERSION = "v26 · 2026-08-17";
 document.getElementById("app-version").textContent = APP_VERSION;
 
 let leafletMap;
@@ -1111,7 +1111,14 @@ function applyOverlapClusters(hikeList, clusters, zoom) {
         info = clusterInfo[info.selfSnapToIndex] || null;
       }
       if (!info || !info.otherRank) return [baseLat, baseLng];
-      const offsetStepM = 8 * metersPerPixel(baseLat, zoom); // 8px gap, enough to clear the halo'd line width
+      // otherRank is a SIGNED rank, not a magnitude of 1 — pairMagnitude keeps it in 0.40-0.60 per
+      // partner on purpose (see above), so "8px" here was never actually reaching 8px on screen.
+      // Measured directly against a real saved pair (rank ±0.45, the typical single-partner case):
+      // center-to-center came out to 7px — exactly the white halo's own width (haloWeight 7 on a
+      // default-state line), meaning the two halos touched edge-to-edge with zero visible gap.
+      // 18 puts that same typical case at ~14-16px center-to-center, clearing the halo on both
+      // sides (up to 9px wide on a "selected" line) with room to spare.
+      const offsetStepM = 18 * metersPerPixel(baseLat, zoom);
       const offsetDeg = (info.otherRank * offsetStepM) / 111320;
       return [baseLat + info.perpLat * offsetDeg, baseLng + info.perpLng * offsetDeg];
     });
