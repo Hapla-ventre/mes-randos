@@ -9,7 +9,7 @@ const COLOR_EDITING = "#2980b9";  // rando en cours de modification / création
 // Bumped by hand on every change, shown in the sidebar footer — GitHub Pages can take a minute to
 // actually serve a new push, and the browser can also just be showing a cached copy, so this is
 // the one reliable way to confirm you're testing the version you think you're testing.
-const APP_VERSION = "v31 · 2026-08-17";
+const APP_VERSION = "v32 · 2026-08-17";
 document.getElementById("app-version").textContent = APP_VERSION;
 
 let leafletMap;
@@ -960,15 +960,20 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
   // tangents must be roughly parallel or anti-parallel (the same trail walked either way), not at a
   // real angle to each other — the same principle as the self-merge direction check above.
   const CROSS_HIKE_MIN_PARALLEL_DOT = 0.6;
-  const otherSets = {};
-  hikeList.forEach((h) => { otherSets[h.id] = h.coordinates.map(() => new Set()); });
+  // Per point, per confirmed partner: the partner's own matched point index and whether the two
+  // were walked the SAME way there (sign +1) or OPPOSITE ways (sign -1, dot product was negative
+  // before the Math.abs above). Kept alongside the plain partner-id sets below because the
+  // ordinal lane ranking only needs "who's nearby" while the orientation solver two steps down
+  // needs the actual geometric relationship.
+  const otherInfo = {};
+  hikeList.forEach((h) => { otherInfo[h.id] = h.coordinates.map(() => new Map()); });
   if (includeOtherHikes) {
     hikeList.forEach((h) => {
       const cumDist = cumDistByHike[h.id];
       h.coordinates.forEach(([lat, lng], i) => {
         const [tLat, tLng] = crossTangentAt(h.coordinates, cumDist, i);
         neighborsOf(lat, lng).forEach((q) => {
-          if (q.hikeId === h.id) return;
+          if (q.hikeId === h.id || otherInfo[h.id][i].has(q.hikeId)) return;
           const otherCoords = hikeById.get(q.hikeId).coordinates;
           // Test against the two segments touching this candidate VERTEX, not the vertex itself —
           // on a sparse straight stretch the nearest vertex of the other hike can be tens of
@@ -981,25 +986,32 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
             const dLat = b[0] - a[0], dLng = b[1] - a[1];
             const len = Math.hypot(dLat, dLng) || 1;
             const [qLat, qLng] = [dLat / len, dLng / len];
-            if (Math.abs(tLat * qLat + tLng * qLng) < CROSS_HIKE_MIN_PARALLEL_DOT) continue; // crossing at an angle, not running alongside
-            otherSets[h.id][i].add(q.hikeId);
+            const dot = tLat * qLat + tLng * qLng;
+            if (Math.abs(dot) < CROSS_HIKE_MIN_PARALLEL_DOT) continue; // crossing at an angle, not running alongside
+            const matchedIndex = haversineMeters([lat, lng], a) <= haversineMeters([lat, lng], b) ? ia : ib;
+            otherInfo[h.id][i].set(q.hikeId, { matchedIndex, sign: dot >= 0 ? 1 : -1 });
             break;
           }
         });
       });
     });
   }
-  const filteredOtherSets = {};
+  const filteredOtherSets = {};   // hikeId -> [Set(partnerId), ...] — who's nearby, for lane ranking
+  const filteredOtherInfo = {};   // hikeId -> [Map(partnerId -> {matchedIndex, sign}), ...] — for orientation
   hikeList.forEach((h) => {
-    const raw = otherSets[h.id];
+    const raw = otherInfo[h.id];
     const cumDist = cumDistByHike[h.id];
-    const filtered = raw.map(() => new Set());
+    const filteredSets = raw.map(() => new Set());
+    const filteredInfo = raw.map(() => new Map());
     const partners = new Set();
-    raw.forEach((s) => s.forEach((id) => partners.add(id)));
+    raw.forEach((m) => m.forEach((info, id) => partners.add(id)));
     partners.forEach((otherId) => {
-      filterRuns(cumDist, (i) => raw[i].has(otherId), OVERLAP_MIN_RUN_METERS).forEach((keep, i) => { if (keep) filtered[i].add(otherId); });
+      filterRuns(cumDist, (i) => raw[i].has(otherId), OVERLAP_MIN_RUN_METERS).forEach((keep, i) => {
+        if (keep) { filteredSets[i].add(otherId); filteredInfo[i].set(otherId, raw[i].get(otherId)); }
+      });
     });
-    filteredOtherSets[h.id] = filtered;
+    filteredOtherSets[h.id] = filteredSets;
+    filteredOtherInfo[h.id] = filteredInfo;
   });
 
   // Each hike is assigned an ordinal LANE among every hike overlapping it at this exact point
@@ -1025,24 +1037,16 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
     });
   });
 
-  // Smooth the lane offset along each hike's own sequence so it eases in and out gradually
-  // instead of snapping between sides.
-  const TANGENT_SMOOTH_WINDOW_M = 20;    // real-distance window for the DIRECTION smoothing below
-  const clusters = {};
+  // Real-distance-smoothed tangent + its "coherence" (how consistent the raw tangents inside the
+  // window actually are — opposite-direction tangents cancel each other out, so a genuine hairpin
+  // reads as low coherence), for every point of every hike.
+  const TANGENT_SMOOTH_WINDOW_M = 20;
+  const smoothedTangentByHike = {};
   hikeList.forEach((h) => {
-    const raw = rawLaneOffsets[h.id];
     const coords = h.coordinates;
     const cumDist = cumDistByHike[h.id];
-    // Raw per-point tangents, precomputed once so the window sum below is cheap — used ONLY to
-    // pick which side of the trail this hike's offset nudges to, never for detection (self-merge
-    // still uses the sharp, un-smoothed tangentAt directly, see above).
     const rawTangents = coords.map((_, i) => tangentAt(coords, i));
-
-    // Real-distance-smoothed tangent + its "coherence" (how consistent the raw tangents inside
-    // the window actually are — opposite-direction tangents cancel each other out, so a genuine
-    // hairpin reads as low coherence) at every point, computed once up front so the sequential
-    // pass below can stay cheap.
-    const smoothedTangent = coords.map((_, i) => {
+    smoothedTangentByHike[h.id] = coords.map((_, i) => {
       const here = cumDist[i];
       let ta = i;
       while (ta > 0 && (ta === i || here - cumDist[ta] < TANGENT_SMOOTH_WINDOW_M)) ta--;
@@ -1053,35 +1057,102 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
       const tLen = Math.hypot(sumTLat, sumTLng) || 1;
       return { tLat: sumTLat / tLen, tLng: sumTLng / tLen, coherence: Math.hypot(sumTLat, sumTLng) / (tb - ta + 1) };
     });
+  });
 
-    // Turn that smoothed tangent into a CONSISTENT perpendicular reference by walking the hike in
-    // order and, at each point, keeping whichever of the two opposite unit directions is CLOSER TO
-    // THE PREVIOUS POINT's choice — rather than re-deciding independently at every point against a
-    // fixed external axis (e.g. "always point roughly north"). A fixed per-point axis is what
-    // caused the direction to visibly snap across right at a switchback's hairpin apex: the
-    // smoothed tangent sweeps continuously through every compass direction over a ~180° turn, so
-    // it's guaranteed to cross whatever fixed axis the threshold uses at some point during that
-    // sweep, and that crossing forces an instant flip — a tightly-sampled real hairpin compresses
-    // the whole sweep into just one or two points, so the two tracks visibly touch/cross exactly
-    // there. Propagating from the immediately preceding point instead means the chosen direction
-    // just keeps rotating smoothly through the turn, the same way the underlying geometry does,
-    // with no point ever disagreeing with its neighbor. Seeded with the old fixed-axis rule only
-    // at the very first point (i=0) — from there on, continuity does the work. Two hikes on the
-    // SAME physical trail recorded in opposite walking directions (explicitly treated as "the same
-    // trail" by the direction check above via Math.abs) still end up agreeing on the same
-    // orientation once propagation has had a chance to settle, since it's their shared GEOMETRY
-    // driving the choice, not each one's own arbitrary starting point.
-    let prevCanon = null;
-    const canonTangent = smoothedTangent.map(({ tLat, tLng }) => {
-      if (prevCanon === null) {
-        if (tLat < 0 || (tLat === 0 && tLng < 0)) { tLat = -tLat; tLng = -tLng; }
-      } else if (tLat * prevCanon[0] + tLng * prevCanon[1] < 0) {
-        tLat = -tLat; tLng = -tLng;
-      }
-      prevCanon = [tLat, tLng];
-      return prevCanon;
+  // ----- Global direction consistency (union-find with a relative sign per edge) -----
+  // The offset direction needs a perpendicular reference that is BOTH locally smooth along each
+  // hike's own path (no jump at a switchback apex, where the trail direction genuinely reverses)
+  // AND globally agreed upon between any two DIFFERENT hikes that share the same physical trail
+  // (regardless of which one was walked backwards). A single fixed compass-style axis can satisfy
+  // only one of these at a time: forcing every point to agree with a fixed axis independently
+  // fixes cross-hike agreement but snaps at the exact point a hike's own tangent crosses that axis
+  // (which a ~180° hairpin is guaranteed to do); propagating from each point to the next fixes
+  // local smoothness but has no way to agree with a *different* hike whose own propagation started
+  // from an unrelated point elsewhere on the map.
+  //
+  // Treating it as an actual constraint network solves both at once: every "these two should end
+  // up on the same side" / "opposite sides" relationship — between a point and its own neighbor
+  // along the same hike, or between two DIFFERENT hikes' matched points — becomes a weighted
+  // union-find edge (sign +1 = same side, -1 = opposite). One pass over every edge finds a sign
+  // assignment that satisfies all of them simultaneously wherever that's geometrically possible
+  // (which real trail geometry essentially always allows), instead of guessing point by point.
+  const nodeIndex = new Map();     // "hikeId|i" -> numeric node id
+  const nodeOwner = [];            // node id -> [hikeId, i], for reading back which point a root represents
+  const parent = [];
+  const parityToParent = [];       // sign of this node relative to `parent[node]` (not necessarily the root — see find())
+  function nodeOf(hikeId, i) {
+    const key = hikeId + "|" + i;
+    let id = nodeIndex.get(key);
+    if (id === undefined) {
+      id = nodeOwner.length;
+      nodeIndex.set(key, id);
+      nodeOwner.push([hikeId, i]);
+      parent.push(id);
+      parityToParent.push(1);
+    }
+    return id;
+  }
+  // Iterative (not recursive) so a single long hike's chain of same-point edges can't overflow
+  // the call stack. Path-compresses every node visited along the way to the node's parity
+  // relative to the root, so repeated find()s on the same component stay cheap.
+  function find(x) {
+    const path = [];
+    let node = x;
+    while (parent[node] !== node) { path.push(node); node = parent[node]; }
+    const root = node;
+    let parity = 1;
+    for (let k = path.length - 1; k >= 0; k--) {
+      parity *= parityToParent[path[k]];
+      parent[path[k]] = root;
+      parityToParent[path[k]] = parity;
+    }
+    return [root, path.length ? parityToParent[path[0]] : 1];
+  }
+  function union(x, y, sign) {
+    const [rx, px] = find(x);
+    const [ry, py] = find(y);
+    if (rx === ry) return; // already related; a genuine contradiction here would mean the trail geometry itself is inconsistent, which doesn't happen in practice
+    parent[rx] = ry;
+    parityToParent[rx] = sign * px * py;
+  }
+  // Same-hike edges: point i agrees or disagrees with point i-1 depending on whether their
+  // (already smoothed) tangents point the same general way — this is what keeps the direction
+  // rotating smoothly through a hairpin instead of flipping.
+  hikeList.forEach((h) => {
+    const tangents = smoothedTangentByHike[h.id];
+    for (let i = 1; i < tangents.length; i++) {
+      const sign = tangents[i - 1].tLat * tangents[i].tLat + tangents[i - 1].tLng * tangents[i].tLng >= 0 ? 1 : -1;
+      union(nodeOf(h.id, i - 1), nodeOf(h.id, i), sign);
+    }
+  });
+  // Cross-hike edges: point i of h agrees or disagrees with the matched point on each confirmed
+  // partner, using the sign already captured during detection — this is what keeps two DIFFERENT
+  // hikes (however each was individually recorded) agreeing on the same side.
+  hikeList.forEach((h) => {
+    filteredOtherInfo[h.id].forEach((partners, i) => {
+      partners.forEach(({ matchedIndex, sign }, partnerId) => {
+        union(nodeOf(h.id, i), nodeOf(partnerId, matchedIndex), sign);
+      });
     });
+  });
+  // Final canonical tangent for a point: its sign relative to its component's root, times a
+  // reasonable default orientation picked for that root (northward-leaning, purely cosmetic —
+  // any consistent choice works equally well since every OTHER node in the component is defined
+  // relative to it, not to a fixed axis).
+  function canonicalTangentAt(hikeId, i) {
+    const [root, parity] = find(nodeOf(hikeId, i));
+    const [rHikeId, rI] = nodeOwner[root];
+    const rt = smoothedTangentByHike[rHikeId][rI];
+    const seed = rt.tLat < 0 || (rt.tLat === 0 && rt.tLng < 0) ? -1 : 1;
+    const t = smoothedTangentByHike[hikeId][i];
+    return parity * seed >= 0 ? [t.tLat, t.tLng] : [-t.tLat, -t.tLng];
+  }
 
+  // Smooth the lane offset along each hike's own sequence so it eases in and out gradually
+  // instead of snapping between sides.
+  const clusters = {};
+  hikeList.forEach((h) => {
+    const raw = rawLaneOffsets[h.id];
     clusters[h.id] = raw.map((_, i) => {
       const start = Math.max(0, i - OVERLAP_SMOOTH_WINDOW);
       const end = Math.min(raw.length, i + OVERLAP_SMOOTH_WINDOW + 1);
@@ -1108,12 +1179,11 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
       if (Math.abs(laneOffset) < 0.05 && selfSnapToIndex === null) return null;
 
       // Floored at 0.7: a genuine hairpin still tapers the offset a little (softening whatever
-      // residual direction change is left even after the continuity fix above) but can never lose
-      // more than 30% of its magnitude just because the trail curves — an uncapped multiplier was
-      // crushing the offset toward invisible on any real, moderately winding trail, not just at
-      // sharp switchback apexes.
-      const coherenceFactor = Math.max(smoothedTangent[i].coherence, 0.7);
-      const [tLat, tLng] = canonTangent[i];
+      // residual direction change is left) but can never lose more than 30% of its magnitude just
+      // because the trail curves — an uncapped multiplier was crushing the offset toward invisible
+      // on any real, moderately winding trail, not just at sharp switchback apexes.
+      const coherenceFactor = Math.max(smoothedTangentByHike[h.id][i].coherence, 0.7);
+      const [tLat, tLng] = canonicalTangentAt(h.id, i);
       return { laneOffset: laneOffset * coherenceFactor, selfSnapToIndex, perpLat: -tLng, perpLng: tLat };
     });
   });
