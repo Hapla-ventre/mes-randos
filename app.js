@@ -9,7 +9,7 @@ const COLOR_EDITING = "#2980b9";  // rando en cours de modification / création
 // Bumped by hand on every change, shown in the sidebar footer — GitHub Pages can take a minute to
 // actually serve a new push, and the browser can also just be showing a cached copy, so this is
 // the one reliable way to confirm you're testing the version you think you're testing.
-const APP_VERSION = "v19 · 2026-08-17";
+const APP_VERSION = "v20 · 2026-08-17";
 document.getElementById("app-version").textContent = APP_VERSION;
 
 let leafletMap;
@@ -682,7 +682,7 @@ function metersPerPixel(lat, zoom) {
   return (156543.03392 * Math.cos((lat * Math.PI) / 180)) / Math.pow(2, zoom);
 }
 
-const OVERLAP_THRESHOLD_M = 20;        // cross-hike (different randos) merge distance — conservative
+const OVERLAP_THRESHOLD_M = 28;        // cross-hike (different randos) separation distance — two independently-routed hikes on "the same trail" can genuinely sit further apart than they feel like they should on the ground
 const SELF_OVERLAP_THRESHOLD_M = 35;   // self-merge (same rando's own out-and-back) — a bit more generous, safe because the direction check (see SELF_OPPOSITE_MAX_DOT below) is what actually guards against false positives, not this number
 const SELF_OPPOSITE_MAX_DOT = -0.3;    // the two candidate points' local travel directions, as unit vectors, must dot to below this to count as "opposite ways" (-1 = exact U-turn, 0 = perpendicular, +1 = same direction) — this is what tells a real retrace apart from a switchback leg merely passing nearby
 const OVERLAP_SMOOTH_WINDOW = 8;       // points of smoothing on the cross-hike offset, so it ramps in/out instead of snapping side to side
@@ -756,20 +756,17 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
 
   // ----- 1. Self-merge detection -----
   // Nearest candidate (by distance) among same-hike points that are far enough away in the point
-  // list, travelling in roughly the opposite direction, AND — the strongest signal of all,
-  // wherever elevation data is available — at roughly the same ALTITUDE. This is what a switchback
-  // fundamentally can't fake: its whole purpose is to gain elevation with every leg, so two nearby
-  // switchback legs sit at meaningfully different altitudes, while a genuine retrace revisits the
-  // literal same spot on the ground and its altitude barely differs. Distance and direction alone
-  // can't tell a real retrace apart from a single switchback leg-pair (see the pivot check below
-  // for the rest of that story) — elevation is the one signal a switchback structurally cannot
-  // share with a real out-and-back, so it rules out the great majority of false positives right at
-  // the source, before a candidate is even considered.
-  const SELF_ELEVATION_TOLERANCE_M = 10;
+  // list and travelling in roughly the opposite direction. (An elevation check was tried here too —
+  // reject candidates at a meaningfully different altitude, since a switchback climbs with every leg
+  // while a genuine retrace revisits the same spot — but real elevation data is too noisy for that
+  // to be reliable: the noise on the SAME physical point measured twice and the gain of a gentle
+  // switchback leg turned out to be roughly the same size, so no tolerance value avoided rejecting
+  // genuine retraces without also letting switchbacks through. Dropped in favor of the pivot check
+  // below, which looks at the whole hike instead of one point at a time and doesn't have that
+  // problem.)
   const selfMatchIndex = {}; // hikeId -> per-point index it re-meets its own path at, or -1
   hikeList.forEach((h) => { selfMatchIndex[h.id] = new Array(h.coordinates.length).fill(-1); });
   hikeList.forEach((h) => {
-    const elevations = h.elevations;
     h.coordinates.forEach(([lat, lng], i) => {
       const [tLat, tLng] = tangentAt(h.coordinates, i);
       let bestDist = Infinity;
@@ -780,8 +777,6 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
         if (d >= SELF_OVERLAP_THRESHOLD_M || d >= bestDist) return;
         const [qLat, qLng] = tangentAt(h.coordinates, q.i);
         if (tLat * qLat + tLng * qLng >= SELF_OPPOSITE_MAX_DOT) return; // not travelling opposite ways
-        if (elevations && elevations[i] != null && elevations[q.i] != null &&
-            Math.abs(elevations[i] - elevations[q.i]) > SELF_ELEVATION_TOLERANCE_M) return; // different altitude — not the same spot
         bestDist = d;
         selfMatchIndex[h.id][i] = q.i;
       });

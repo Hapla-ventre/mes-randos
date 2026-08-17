@@ -119,9 +119,13 @@ Le site se met à jour automatiquement en ~1 minute (GitHub Pages).
   pour distinguer tes randos, mais pas géométriquement parfait sur des croisements complexes.
 - L'aller et le retour d'une même rando sont fusionnés en un seul trait plutôt qu'écartés (même
   couleur, rien à distinguer). Pour ne pas confondre un vrai aller-retour avec un chemin qui fait des
-  lacets (proche de lui-même mais pas du tout le même trajet), la fusion exige trois choses à la fois :
-  un point proche, parcouru en sens inverse, à une altitude similaire — et seul le plus grand groupe de
-  points cohérent entre eux est retenu, pas n'importe quelle coïncidence locale.
+  lacets (proche de lui-même mais pas du tout le même trajet), la fusion exige un point proche
+  parcouru en sens inverse, et ne retient que le plus grand groupe de points cohérents entre eux sur
+  toute la rando (un vrai aller-retour se reflète autour d'un seul point de retournement stable, des
+  lacets produisent plusieurs petits groupes incohérents entre eux). L'altitude a aussi été essayée
+  comme critère supplémentaire, mais le bruit normal des données d'altitude s'est révélé du même
+  ordre de grandeur que le dénivelé d'un lacet à faible pente — impossible de fixer un seuil qui
+  distingue proprement les deux, donc ce critère a été abandonné au profit du seul point ci-dessus.
 - Aucune donnée n'est envoyée ailleurs qu'à ton propre projet Firebase, à OpenRouteService (pour le calcul d'itinéraire)
   et à Open-Meteo (altitude, en secours, anonyme et sans clé).
 - Leaflet et le SDK Firebase sont embarqués localement dans `vendor/` (pas de dépendance à un CDN externe).
