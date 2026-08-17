@@ -9,7 +9,7 @@ const COLOR_EDITING = "#2980b9";  // rando en cours de modification / création
 // Bumped by hand on every change, shown in the sidebar footer — GitHub Pages can take a minute to
 // actually serve a new push, and the browser can also just be showing a cached copy, so this is
 // the one reliable way to confirm you're testing the version you think you're testing.
-const APP_VERSION = "v18 · 2026-08-17";
+const APP_VERSION = "v19 · 2026-08-17";
 document.getElementById("app-version").textContent = APP_VERSION;
 
 let leafletMap;
@@ -644,6 +644,29 @@ function renderHikeLayers() {
 }
 
 // ---------- Distinct colors & metro-style overlap offset ----------
+//
+// THE RULES, in plain terms — two completely separate mechanisms, kept deliberately independent
+// so neither can interfere with the other:
+//
+// 1. SELF-MERGE: wherever a hike's own path comes back and retraces itself (an out-and-back), the
+//    later pass is drawn exactly on top of the earlier one. Same rando, same color, so there is
+//    nothing to visually tell apart — one continuous line is the correct picture, not two.
+//    "Retracing itself" is decided by TWO conditions together, both required:
+//      a) close by (within SELF_OVERLAP_THRESHOLD_M in real distance), AND
+//      b) travelling in roughly the OPPOSITE direction at that point (a real U-turn, not just a
+//         nearby bit of trail heading the same general way).
+//    Condition (b) is what a plain distance check can't tell you: a switchback climbs past itself
+//    every few meters without ever being "the same out-and-back leg" — those legs run roughly
+//    PARALLEL (similar direction), not opposite, so the direction check correctly leaves them
+//    alone. Without it, a generous distance threshold merges switchback legs into each other and
+//    drags the line off the real trail — which is exactly the bug this replaced.
+//
+// 2. CROSS-HIKE SEPARATION: wherever a DIFFERENT hike's path comes within OVERLAP_THRESHOLD_M,
+//    both are nudged a small, fixed distance to either side of their real position — genuinely
+//    different trails (different color) worth telling apart, drawn like parallel metro lines
+//    instead of one solid stack. This threshold stays conservative (tighter than self-merge's)
+//    because merging two unrelated hikes together would be the actual mistake here, the opposite
+//    problem from self-merge.
 const DISTINCT_COLORS = ["#2e7d32", "#2980b9", "#e67e22", "#8e44ad", "#16a085", "#d35400", "#c0392b", "#2c3e50", "#f39c12", "#7f8c8d"];
 
 function colorForHikeId(id) {
@@ -659,33 +682,23 @@ function metersPerPixel(lat, zoom) {
   return (156543.03392 * Math.cos((lat * Math.PI) / 180)) / Math.pow(2, zoom);
 }
 
-// Approximation, not true segment-level route bundling: wherever paths pass within
-// OVERLAP_THRESHOLD_M of each other in reality, nudge them apart perpendicular to the direction
-// of travel so they read like parallel metro lines instead of one solid stack (or, for an
-// out-and-back, like two clean parallel legs instead of one messy near-identical double line).
-const OVERLAP_THRESHOLD_M = 20;
-const OVERLAP_SMOOTH_WINDOW = 8; // points of smoothing on the offset, so it ramps in/out instead of snapping side to side
-const OVERLAP_MIN_RUN_POINTS = 6; // two trails merely crossing at an angle (or a route brushing its own path once) stay within threshold for only a point or two — require a genuinely sustained run before treating it as "the same path", so a brief crossing doesn't get separated needlessly
-const OVERLAP_MIN_SELF_INDEX_GAP = 15; // how many points apart on the SAME hike before two nearby points count as a separate pass rather than just neighboring points on the same pass (e.g. a bend in the trail)
-// A hike's own out-and-back gets a much MORE generous distance threshold than two different hikes
-// do: the two legs are routed independently (once "there", once "back"), and can end up genuinely
-// tens of meters apart around a trailhead, car park, or junction even though it's unmistakably the
-// same hike on the same trail — a mismatch that's completely harmless to merge (same color either
-// way, worst case the line is a few meters less precise over a short stretch). Merging two
-// DIFFERENT hikes too eagerly is the real risk (drawing genuinely different trails as one), so
-// that one stays conservative at OVERLAP_THRESHOLD_M.
-const SELF_OVERLAP_THRESHOLD_M = 50;
-const BRIDGE_MAX_GAP_POINTS = 60; // how many consecutive points of a short self-overlap dropout still get bridged into one continuous merge
+const OVERLAP_THRESHOLD_M = 20;        // cross-hike (different randos) merge distance — conservative
+const SELF_OVERLAP_THRESHOLD_M = 35;   // self-merge (same rando's own out-and-back) — a bit more generous, safe because the direction check (see SELF_OPPOSITE_MAX_DOT below) is what actually guards against false positives, not this number
+const SELF_OPPOSITE_MAX_DOT = -0.3;    // the two candidate points' local travel directions, as unit vectors, must dot to below this to count as "opposite ways" (-1 = exact U-turn, 0 = perpendicular, +1 = same direction) — this is what tells a real retrace apart from a switchback leg merely passing nearby
+const OVERLAP_SMOOTH_WINDOW = 8;       // points of smoothing on the cross-hike offset, so it ramps in/out instead of snapping side to side
+const OVERLAP_MIN_RUN_POINTS = 6;      // require a sustained run before treating two paths as "running together" — a brief crossing at an angle shouldn't trigger anything
+const OVERLAP_MIN_SELF_INDEX_GAP = 15; // how many points apart in the SAME hike's own point list before two nearby points can even be considered a separate pass (otherwise every bend in the trail would "match itself")
+const BRIDGE_MAX_GAP_POINTS = 30;      // bridges short dropouts (a few points where the distance/direction check briefly fails) between two confirmed self-merge runs, so a clearly-shared corridor doesn't flicker on and off
 
-// The expensive step: for every point of every hike, find every OTHER point within
-// OVERLAP_THRESHOLD_M — from a different hike (if includeOtherHikes), or a distant point of the
-// SAME hike retracing its own path (always) — via a spatial grid so this is roughly linear in
-// the total point count instead of comparing every pair. Doesn't depend on zoom, so it's cached
-// by the caller and only rebuilt when the hikes (or this flag) actually change.
+// The expensive step: for every point of every hike, find every OTHER point within threshold —
+// from a different hike (if includeOtherHikes), or a distant point of the SAME hike retracing its
+// own path (always) — via a spatial grid so this is roughly linear in the total point count
+// instead of comparing every pair. Doesn't depend on zoom, so it's cached by the caller and only
+// rebuilt when the hikes (or this flag) actually change.
 function buildOverlapClusters(hikeList, includeOtherHikes) {
   const cellIndex = new Map();
-  // Sized to the LARGER of the two thresholds (self-overlap's is more generous — see above) so the
-  // ±1-cell neighbor scan below reliably reaches that far regardless of which check is running.
+  // Sized to the LARGER of the two thresholds so the ±1-cell neighbor scan below reliably reaches
+  // that far regardless of which check (self or cross-hike) is running.
   const cellSizeDeg = Math.max(OVERLAP_THRESHOLD_M, SELF_OVERLAP_THRESHOLD_M) / 111320;
 
   function cellKey(lat, lng) {
@@ -712,10 +725,19 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
     return out;
   }
 
-  // Drop any pairing (with another hike's track, or with the hike's own later pass) that isn't
-  // sustained for at least OVERLAP_MIN_RUN_POINTS in a row — a couple of trails merely crossing at
-  // an angle, or a route just grazing its own earlier path once, only satisfy the distance
-  // threshold for a point or two, which isn't "running together" and shouldn't trigger a separation.
+  // The local direction of travel at point i, as a unit vector — used both to decide "opposite
+  // direction" for self-merge and as the perpendicular nudge direction for cross-hike separation.
+  function tangentAt(coords, i) {
+    const prev = coords[Math.max(0, i - 1)];
+    const next = coords[Math.min(coords.length - 1, i + 1)];
+    const dLat = next[0] - prev[0], dLng = next[1] - prev[1];
+    const len = Math.hypot(dLat, dLng) || 1;
+    return [dLat / len, dLng / len];
+  }
+
+  // Require a sustained run before treating two paths as "running together" (used for both self
+  // and cross-hike) — a couple of trails merely crossing at an angle, or a route just grazing its
+  // own earlier path once, only satisfy the distance+direction check for a point or two.
   function filterRuns(n, presentAt) {
     const filtered = new Array(n).fill(false);
     let runStart = -1;
@@ -732,38 +754,90 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
     return filtered;
   }
 
-  // Self-overlap: a hike meeting its own path again later (e.g. an out-and-back's return leg).
-  // Picks the NEAREST candidate within threshold, not just the first one the grid scan happens to
-  // turn up — with the return leg's points snapping onto whichever match they're assigned (see
-  // below), taking "first found" let the snap target jump between unrelated nearby points instead
-  // of tracking the genuinely closest one, which is what rendered as a jagged, self-crossing mess
-  // instead of a clean retrace of the outbound leg.
+  // ----- 1. Self-merge detection -----
+  // Nearest candidate (by distance) among same-hike points that are far enough away in the point
+  // list, travelling in roughly the opposite direction, AND — the strongest signal of all,
+  // wherever elevation data is available — at roughly the same ALTITUDE. This is what a switchback
+  // fundamentally can't fake: its whole purpose is to gain elevation with every leg, so two nearby
+  // switchback legs sit at meaningfully different altitudes, while a genuine retrace revisits the
+  // literal same spot on the ground and its altitude barely differs. Distance and direction alone
+  // can't tell a real retrace apart from a single switchback leg-pair (see the pivot check below
+  // for the rest of that story) — elevation is the one signal a switchback structurally cannot
+  // share with a real out-and-back, so it rules out the great majority of false positives right at
+  // the source, before a candidate is even considered.
+  const SELF_ELEVATION_TOLERANCE_M = 10;
   const selfMatchIndex = {}; // hikeId -> per-point index it re-meets its own path at, or -1
   hikeList.forEach((h) => { selfMatchIndex[h.id] = new Array(h.coordinates.length).fill(-1); });
   hikeList.forEach((h) => {
+    const elevations = h.elevations;
     h.coordinates.forEach(([lat, lng], i) => {
+      const [tLat, tLng] = tangentAt(h.coordinates, i);
       let bestDist = Infinity;
       neighborsOf(lat, lng).forEach((q) => {
         if (q.hikeId !== h.id) return;
         if (Math.abs(q.i - i) < OVERLAP_MIN_SELF_INDEX_GAP) return;
         const d = haversineMeters([lat, lng], [q.lat, q.lng]);
-        if (d < SELF_OVERLAP_THRESHOLD_M && d < bestDist) {
-          bestDist = d;
-          selfMatchIndex[h.id][i] = q.i;
-        }
+        if (d >= SELF_OVERLAP_THRESHOLD_M || d >= bestDist) return;
+        const [qLat, qLng] = tangentAt(h.coordinates, q.i);
+        if (tLat * qLat + tLng * qLng >= SELF_OPPOSITE_MAX_DOT) return; // not travelling opposite ways
+        if (elevations && elevations[i] != null && elevations[q.i] != null &&
+            Math.abs(elevations[i] - elevations[q.i]) > SELF_ELEVATION_TOLERANCE_M) return; // different altitude — not the same spot
+        bestDist = d;
+        selfMatchIndex[h.id][i] = q.i;
       });
     });
   });
+  // Distance and direction alone still aren't enough: a switchback is made of legs that are close
+  // together AND run opposite ways from one leg to the next (climb north on leg 1, climb south on
+  // leg 2, north again on leg 3…) — a SINGLE leg-pair out of that switchback is geometrically
+  // indistinguishable from a short genuine retrace, direction check included. What tells them apart
+  // has to be a GLOBAL view of the whole hike, not a per-point or per-run local one: a real
+  // out-and-back mirrors its ENTIRE overlapping stretch around one fixed turnaround point, so index
+  // + matchedIndex ("the pivot") is nearly constant across potentially hundreds of matched points.
+  // A switchback instead produces many small, mutually inconsistent pivots, one per leg-pair, each
+  // only as long as a single leg. Group every raw match by pivot, keep only the SINGLE largest
+  // group, and require that group to span a real minimum distance — long enough that it couldn't
+  // just be one switchback leg pretending to be a retrace.
+  const PIVOT_DRIFT_TOLERANCE = 25;
+  const MIN_SELF_MERGE_SPAN_M = 100;
+  function dominantPivotCluster(h) {
+    const matchIndex = selfMatchIndex[h.id];
+    const points = [];
+    matchIndex.forEach((m, i) => { if (m !== -1) points.push({ i, pivot: i + m }); });
+    points.sort((a, b) => a.pivot - b.pivot);
+    const clusters = [];
+    let current = [];
+    points.forEach((p) => {
+      if (current.length && p.pivot - current[current.length - 1].pivot > PIVOT_DRIFT_TOLERANCE) {
+        clusters.push(current);
+        current = [];
+      }
+      current.push(p);
+    });
+    if (current.length) clusters.push(current);
+    if (clusters.length === 0) return new Set();
+
+    const dominant = clusters.reduce((a, b) => (b.length > a.length ? b : a));
+    const idx = dominant.map((p) => p.i).sort((a, b) => a - b);
+    let spanM = 0;
+    for (let k = idx[0]; k < idx[idx.length - 1]; k++) spanM += haversineMeters(h.coordinates[k], h.coordinates[k + 1]);
+    if (spanM < MIN_SELF_MERGE_SPAN_M) return new Set();
+    return new Set(idx);
+  }
+  const selfCandidateIndex = {};
+  hikeList.forEach((h) => { selfCandidateIndex[h.id] = dominantPivotCluster(h); });
+
   const filteredSelf = {};
-  hikeList.forEach((h) => { filteredSelf[h.id] = filterRuns(h.coordinates.length, (i) => selfMatchIndex[h.id][i] !== -1); });
+  hikeList.forEach((h) => {
+    filteredSelf[h.id] = filterRuns(h.coordinates.length, (i) => selfCandidateIndex[h.id].has(i));
+  });
 
   // The nearest-match choice can still drift a point or two off the "true" mirror index from one
-  // point to the next (the outbound and return legs aren't perfectly parallel), which is enough to
-  // make the snapped return leg visibly zigzag instead of smoothly retracing the outbound one.
-  // Since both legs are walked in a continuous, ordered fashion, the correspondence between them
-  // should also move smoothly — replace each match index with the median of a small window of its
-  // neighbors (only over points that are genuinely part of the same run) to iron out that jitter,
-  // the same principle as the elevation outlier rejection above.
+  // point to the next, which is enough to make the snapped return leg visibly zigzag instead of
+  // smoothly retracing the outbound one. Since both legs are walked in a continuous, ordered
+  // fashion, the correspondence between them should also move smoothly — replace each match index
+  // with the median of a small window of its neighbors to iron out that residual jitter, the same
+  // principle as the elevation outlier rejection above.
   const SELF_MATCH_SMOOTH_WINDOW = 4;
   function smoothSelfMatch(filtered, matchIndex) {
     const n = filtered.length;
@@ -782,14 +856,12 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
   }
   hikeList.forEach((h) => { smoothSelfMatch(filteredSelf[h.id], selfMatchIndex[h.id]); });
 
-  // An out-and-back's two legs are rarely pixel-identical the whole way (the routed geometry for
-  // "there" and "back" can drift apart by a few extra meters here and there, e.g. around a
-  // junction), which made the OVERLAP_THRESHOLD_M distance check flicker in and out along an
-  // otherwise clearly-shared corridor — a short stretch here and there would drop back to
-  // "not overlapping" and render unoffset, right in the middle of two lines that are obviously
-  // the same out-and-back, instead of a clean, continuous separation the whole way. Bridge over
-  // short dropouts (a brief gap sandwiched between two confirmed self-overlap runs) by treating
-  // them as overlapping too, interpolating the missing match index between the two runs.
+  // Bridge short dropouts (a brief gap sandwiched between two confirmed self-merge runs, e.g. one
+  // point where the direction check narrowly failed) so an otherwise clearly-shared corridor
+  // doesn't flicker unmerged for a few meters in the middle of it. Also requires the pivot on both
+  // sides of the gap to roughly agree — without that, this would happily reconnect two runs the
+  // pivot check just separated for being genuinely different retraces (e.g. two different
+  // switchback leg-pairs sitting only a few points apart), undoing that check entirely.
   function bridgeSelfGaps(filtered, matchIndex) {
     const n = filtered.length;
     let i = 0;
@@ -799,9 +871,12 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
       while (j < n && !filtered[j]) j++;
       if (i > 0 && j < n && filtered[i - 1] && filtered[j] && (j - i) <= BRIDGE_MAX_GAP_POINTS) {
         const startVal = matchIndex[i - 1], endVal = matchIndex[j];
-        for (let k = i; k < j; k++) {
-          filtered[k] = true;
-          matchIndex[k] = Math.round(startVal + (endVal - startVal) * ((k - (i - 1)) / (j - (i - 1))));
+        const pivotStart = (i - 1) + startVal, pivotEnd = j + endVal;
+        if (Math.abs(pivotStart - pivotEnd) <= PIVOT_DRIFT_TOLERANCE) {
+          for (let k = i; k < j; k++) {
+            filtered[k] = true;
+            matchIndex[k] = Math.round(startVal + (endVal - startVal) * ((k - (i - 1)) / (j - (i - 1))));
+          }
         }
       }
       i = j;
@@ -809,14 +884,9 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
   }
   hikeList.forEach((h) => { bridgeSelfGaps(filteredSelf[h.id], selfMatchIndex[h.id]); });
 
-  // Pass 2: which OTHER hikes are within threshold at each point — kept per-partner, not summed
-  // yet, so the run-length filter can be applied per pair. Deliberately simple (keyed by hikeId
-  // only, no pass-splitting): an earlier version tried to rank every coincident track (self pass +
-  // every nearby other hike) by sorted position, which fixed the exact-cancellation bug below but
-  // introduced a worse one — in a spot where several hikes converge, which OTHER hikes happen to be
-  // "in range" shifts as you walk along, so an ordinal position among a fluctuating set jumped
-  // around erratically instead of easing smoothly. Independent, fixed-magnitude per-partner
-  // contributions (like this) only ever change gradually as a partner enters/exits range.
+  // ----- 2. Cross-hike overlap detection -----
+  // Which OTHER hikes are within threshold at each point — kept per-partner, not summed yet, so
+  // the run-length filter can be applied per pair.
   const otherSets = {};
   hikeList.forEach((h) => { otherSets[h.id] = h.coordinates.map(() => new Set()); });
   if (includeOtherHikes) {
@@ -842,42 +912,27 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
     filteredOtherSets[h.id] = filtered;
   });
 
-  // Self-overlap and cross-hike overlap get fundamentally different treatment now: a hike's own
-  // out-and-back is the SAME color either way, so there's nothing to visually tell apart — nudging
-  // the two passes to either side just drew two clearly separate parallel lines where a single
-  // trail should read as one. Instead, wherever the LATER pass (i > matchedIdx) meets its own
-  // earlier pass, its point is SNAPPED to sit exactly on the earlier pass's coordinate — the two
-  // passes become pixel-identical there instead of merely close, which is what "the same rando on
-  // the same trail" should look like: one line, not a gap and not the old jittery near-duplicate
-  // either (jittery because "close but not quite" is worse than either "identical" or "offset").
-  // A different hike overlapping the same spot is a genuinely different color worth distinguishing,
-  // so that part keeps the small perpendicular nudge — computed completely independently of self,
-  // so the two mechanisms can no longer interact or partially cancel each other.
-  //
-  // Each PAIR of hikes gets its own magnitude around 0.5 (derived from the pair's ids), instead of
-  // every pair using exactly the same 0.5 — with only two hikes overlapping that wouldn't matter,
-  // but at a busy junction where 3+ hikes converge, each hike's total is a sum of several ±(some
-  // partner's magnitude) terms, and if every pair used the identical 0.5 step, two DIFFERENT hikes
-  // could easily land on the exact same total (e.g. one hike touching 2 partners, another touching
-  // a different single partner, both summing to the same value) — one would render exactly on top
-  // of the other and disappear. Distinct per-pair magnitudes make that coincidence astronomically
-  // unlikely without giving up the gradual, per-partner-independent behavior that keeps this stable
-  // (unlike the ordinal-ranking attempt this replaced, which was collision-free but jumped around
-  // erratically as which hikes were nearby kept changing along the path).
+  // Each hike gets nudged away from every coincident OTHER hike independently: a fixed magnitude
+  // per pair (not per point), so a partner entering or leaving range only ever changes the total
+  // gradually — no ordinal "who's nearby right now" ranking that could jump around as company
+  // changes along the path. Two refinements on top of a plain fixed ±0.5 per partner:
+  //  - each PAIR gets its own magnitude (0.40–0.60, derived from the pair's ids) instead of every
+  //    pair using the exact same 0.5 — at a busy junction where several hikes converge, identical
+  //    magnitudes let two DIFFERENT hikes' sums coincidentally land on the exact same total (one
+  //    would render on top of the other and disappear); distinct per-pair magnitudes make that
+  //    astronomically unlikely.
+  //  - the total is floored away from 0 (by a small per-HIKE amount, so two hikes floored at the
+  //    same point still land on different floors) whenever a hike has at least one partner — a sum
+  //    of several ± terms can otherwise land close to 0 by pure chance even though no individual
+  //    term is small, which reads as "no separation at all" right where it's needed most. A single
+  //    partner alone is always ≥0.40, well clear of the floor, so the ordinary 2-hike case is
+  //    completely unaffected.
   function pairMagnitude(idA, idB) {
     const key = idA < idB ? idA + "|" + idB : idB + "|" + idA;
     let hash = 0;
     for (let i = 0; i < key.length; i++) hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
     return 0.4 + (hash % 21) / 100; // 0.40 .. 0.60
   }
-
-  // With 2 partners in play, a hike's summed ± contributions can still land close to 0 purely by
-  // chance (e.g. -0.45 + 0.42) even though every individual pair-magnitude is comfortably nonzero
-  // — that reads as "no separation at all" right where several hikes converge, exactly where it's
-  // most needed. A single partner alone is always ≥0.40 (well clear of this), so only floor sums
-  // that are already small, and by a per-HIKE (not per-pair) amount — different hikes converging
-  // at the same point get different floors, so clamping doesn't reintroduce the same collision risk
-  // the per-pair magnitudes above were introduced to avoid.
   function selfJitter(id) {
     let hash = 0;
     for (let i = 0; i < id.length; i++) hash = (hash * 31 + id.charCodeAt(i)) >>> 0;
@@ -903,7 +958,7 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
   });
 
   // Smooth the cross-hike rank along each hike's own sequence so it eases in and out gradually
-  // instead of snapping between sides — that snapping is what read as jagged "zigzags" before.
+  // instead of snapping between sides.
   const clusters = {};
   hikeList.forEach((h) => {
     const raw = rawOtherRanks[h.id];
@@ -915,23 +970,23 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
       for (let j = start; j < end; j++) sum += raw[j];
       const otherRank = sum / (end - start);
 
+      // A LATER pass (i > matchedIdx) meeting its own earlier pass gets marked to snap onto it —
+      // see applyOverlapClusters. The earlier pass itself is left alone (it's the reference the
+      // later one moves to), so this only ever applies to one side of a self-merge pair.
       const matchedIdx = filteredSelf[h.id][i] ? selfMatchIndex[h.id][i] : -1;
       const selfSnapToIndex = matchedIdx !== -1 && i > matchedIdx ? matchedIdx : null;
       if (Math.abs(otherRank) < 0.05 && selfSnapToIndex === null) return null;
 
-      const prev = coords[Math.max(0, i - 1)];
-      const next = coords[Math.min(coords.length - 1, i + 1)];
-      const dLat = next[0] - prev[0], dLng = next[1] - prev[1];
-      const len = Math.hypot(dLat, dLng) || 1;
-      return { otherRank, selfSnapToIndex, perpLat: -dLng / len, perpLng: dLat / len };
+      const [tLat, tLng] = tangentAt(coords, i);
+      return { otherRank, selfSnapToIndex, perpLat: -tLng, perpLng: tLat };
     });
   });
 
   return clusters;
 }
 
-// The cheap step: turn the cached per-point rank into an actual coordinate offset for the
-// current zoom. Safe (and fast) to call on every zoomend.
+// The cheap step: turn the cached per-point info into an actual coordinate for the current zoom.
+// Safe (and fast) to call on every zoomend.
 function applyOverlapClusters(hikeList, clusters, zoom) {
   const result = {};
   hikeList.forEach((h) => {
@@ -941,11 +996,11 @@ function applyOverlapClusters(hikeList, clusters, zoom) {
       if (!info) return [lat, lng];
       let baseLat = lat, baseLng = lng;
       if (info.selfSnapToIndex != null) {
-        // Inherit the earlier pass's own cross-hike offset info wholesale here too, not just its
-        // coordinate — this point's own perpendicular direction runs opposite to the earlier
-        // pass's (they travel in opposite directions along the same trail), so applying ITS OWN
-        // offset from the shared base would immediately shove the two "merged" points apart again,
-        // in opposite directions, undoing the whole point of snapping them together.
+        // Snap to the earlier pass's coordinate — and inherit ITS cross-hike info wholesale too,
+        // not just its position: this point's own perpendicular direction runs opposite to the
+        // earlier pass's (they travel in opposite directions along the same trail), so applying
+        // its own offset from the shared base would immediately shove the two "merged" points
+        // apart again, undoing the whole point of snapping them together.
         [baseLat, baseLng] = h.coordinates[info.selfSnapToIndex];
         info = clusterInfo[info.selfSnapToIndex] || null;
       }

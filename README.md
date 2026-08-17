@@ -117,6 +117,11 @@ Le site se met à jour automatiquement en ~1 minute (GitHub Pages).
 - L'écartement "métro" des randos superposées est une approximation par proximité de points (pas une vraie
   détection de tronçons partagés comme le ferait un logiciel de plan de transport) — largement suffisant
   pour distinguer tes randos, mais pas géométriquement parfait sur des croisements complexes.
+- L'aller et le retour d'une même rando sont fusionnés en un seul trait plutôt qu'écartés (même
+  couleur, rien à distinguer). Pour ne pas confondre un vrai aller-retour avec un chemin qui fait des
+  lacets (proche de lui-même mais pas du tout le même trajet), la fusion exige trois choses à la fois :
+  un point proche, parcouru en sens inverse, à une altitude similaire — et seul le plus grand groupe de
+  points cohérent entre eux est retenu, pas n'importe quelle coïncidence locale.
 - Aucune donnée n'est envoyée ailleurs qu'à ton propre projet Firebase, à OpenRouteService (pour le calcul d'itinéraire)
   et à Open-Meteo (altitude, en secours, anonyme et sans clé).
 - Leaflet et le SDK Firebase sont embarqués localement dans `vendor/` (pas de dépendance à un CDN externe).
