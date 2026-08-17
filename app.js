@@ -9,7 +9,7 @@ const COLOR_EDITING = "#2980b9";  // rando en cours de modification / création
 // Bumped by hand on every change, shown in the sidebar footer — GitHub Pages can take a minute to
 // actually serve a new push, and the browser can also just be showing a cached copy, so this is
 // the one reliable way to confirm you're testing the version you think you're testing.
-const APP_VERSION = "v32 · 2026-08-17";
+const APP_VERSION = "v33 · 2026-08-17";
 document.getElementById("app-version").textContent = APP_VERSION;
 
 let leafletMap;
@@ -1111,16 +1111,25 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
   function union(x, y, sign) {
     const [rx, px] = find(x);
     const [ry, py] = find(y);
-    if (rx === ry) return; // already related; a genuine contradiction here would mean the trail geometry itself is inconsistent, which doesn't happen in practice
+    if (rx === ry) return; // already related — silently keeps whichever relationship got established first if this new edge happens to disagree (see note on component scoping below for why that's now rare)
     parent[rx] = ry;
     parityToParent[rx] = sign * px * py;
   }
   // Same-hike edges: point i agrees or disagrees with point i-1 depending on whether their
   // (already smoothed) tangents point the same general way — this is what keeps the direction
-  // rotating smoothly through a hairpin instead of flipping.
+  // rotating smoothly through a hairpin instead of flipping. Only linked where at least one of
+  // the two points is actually part of an overlap (raw lane offset nonzero) — otherwise a single
+  // long hike's chain would connect every one of its overlap encounters, anywhere along its
+  // entire length, into ONE giant component. Two completely unrelated overlaps (this hike meets
+  // partner X at km 5, and separately meets partner Y at km 50) have no reason to be entangled
+  // with each other; keeping components scoped to where they're actually needed also means small
+  // real-world measurement noise on one shared stretch can't silently flip the resolved side on a
+  // totally different, unrelated one sharing only a same hike ID in common.
   hikeList.forEach((h) => {
     const tangents = smoothedTangentByHike[h.id];
+    const raw = rawLaneOffsets[h.id];
     for (let i = 1; i < tangents.length; i++) {
+      if (raw[i - 1] === 0 && raw[i] === 0) continue;
       const sign = tangents[i - 1].tLat * tangents[i].tLat + tangents[i - 1].tLng * tangents[i].tLng >= 0 ? 1 : -1;
       union(nodeOf(h.id, i - 1), nodeOf(h.id, i), sign);
     }
