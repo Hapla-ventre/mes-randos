@@ -9,7 +9,7 @@ const COLOR_EDITING = "#2980b9";  // rando en cours de modification / création
 // Bumped by hand on every change, shown in the sidebar footer — GitHub Pages can take a minute to
 // actually serve a new push, and the browser can also just be showing a cached copy, so this is
 // the one reliable way to confirm you're testing the version you think you're testing.
-const APP_VERSION = "v22 · 2026-08-17";
+const APP_VERSION = "v23 · 2026-08-17";
 document.getElementById("app-version").textContent = APP_VERSION;
 
 let leafletMap;
@@ -694,6 +694,7 @@ const OVERLAP_SMOOTH_WINDOW = 8;       // points of smoothing on the cross-hike 
 const OVERLAP_MIN_RUN_METERS = 30;     // require a sustained run before treating two paths as "running together" — a brief crossing at an angle shouldn't trigger anything
 const MIN_SELF_INDEX_GAP_METERS = 40;  // how far apart ALONG THE TRAIL two points of the same hike must be before they can even be considered a separate pass (otherwise every bend would "match itself")
 const BRIDGE_MAX_GAP_METERS = 60;      // bridges short dropouts (a stretch where the distance/direction check briefly fails) between two confirmed self-merge runs, so a clearly-shared corridor doesn't flicker on and off
+const MAX_POINT_GAP_SAFETY_M = 150;    // worst-case ORS point spacing on a long straight — the grid's neighbor search has to reach at least this far, otherwise two hikes on the very same sparse stretch never even surface each other as CANDIDATES to distance-check, regardless of how tight OVERLAP_THRESHOLD_M itself is
 
 // The expensive step: for every point of every hike, find every OTHER point within threshold —
 // from a different hike (if includeOtherHikes), or a distant point of the SAME hike retracing its
@@ -703,9 +704,12 @@ const BRIDGE_MAX_GAP_METERS = 60;      // bridges short dropouts (a stretch wher
 function buildOverlapClusters(hikeList, includeOtherHikes) {
   const hikeById = new Map(hikeList.map((h) => [h.id, h]));
   const cellIndex = new Map();
-  // Sized to the LARGER of the two thresholds so the ±1-cell neighbor scan below reliably reaches
-  // that far regardless of which check (self or cross-hike) is running.
-  const cellSizeDeg = Math.max(OVERLAP_THRESHOLD_M, SELF_OVERLAP_THRESHOLD_M) / 111320;
+  // Sized to the LARGEST distance the ±1-cell neighbor scan below needs to reliably reach —
+  // not just the overlap thresholds, but also MAX_POINT_GAP_SAFETY_M (see below): on a sparse
+  // stretch, the nearest VERTEX of the other hike can legitimately sit much further away than the
+  // overlap threshold even while the LINE itself is right there, so the grid has to be coarse
+  // enough to still hand back that vertex as a candidate.
+  const cellSizeDeg = Math.max(OVERLAP_THRESHOLD_M, SELF_OVERLAP_THRESHOLD_M, MAX_POINT_GAP_SAFETY_M) / 111320;
 
   function cellKey(lat, lng) {
     return Math.floor(lat / cellSizeDeg) + "_" + Math.floor(lng / cellSizeDeg);
@@ -729,6 +733,26 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
       }
     }
     return out;
+  }
+
+  // Real-world distance from point p to the SEGMENT a→b (not just to its endpoints), via a flat
+  // local projection — valid here since consecutive routed points are never more than a couple
+  // hundred meters apart, well short of where the Earth's curvature would matter. This is what
+  // cross-hike detection actually needs: on a sparse straight stretch, two independently-routed
+  // hikes on the very same physical trail almost never have a VERTEX of one within a few meters of
+  // a VERTEX of the other — their points interleave along the line rather than coinciding — even
+  // though the lines themselves sit right on top of each other. Comparing against the nearest point
+  // on the other hike's line, not just its nearest recorded vertex, is what actually answers "is
+  // this the same trail here".
+  function pointToSegmentMeters(p, a, b) {
+    const mLat = 111320, mLng = 111320 * Math.cos((p[0] * Math.PI) / 180);
+    const px = p[1] * mLng, py = p[0] * mLat;
+    const ax = a[1] * mLng, ay = a[0] * mLat;
+    const bx = b[1] * mLng, by = b[0] * mLat;
+    const dx = bx - ax, dy = by - ay;
+    const lenSq = dx * dx + dy * dy;
+    const t = lenSq === 0 ? 0 : Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / lenSq));
+    return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
   }
 
   // The local direction of travel at point i, as a unit vector — used both to decide "opposite
@@ -917,10 +941,22 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
         const [tLat, tLng] = tangentAt(h.coordinates, i);
         neighborsOf(lat, lng).forEach((q) => {
           if (q.hikeId === h.id) return;
-          if (haversineMeters([lat, lng], [q.lat, q.lng]) >= OVERLAP_THRESHOLD_M) return;
-          const [qLat, qLng] = tangentAt(hikeById.get(q.hikeId).coordinates, q.i);
-          if (Math.abs(tLat * qLat + tLng * qLng) < CROSS_HIKE_MIN_PARALLEL_DOT) return; // crossing at an angle, not running alongside
-          otherSets[h.id][i].add(q.hikeId);
+          const otherCoords = hikeById.get(q.hikeId).coordinates;
+          // Test against the two segments touching this candidate VERTEX, not the vertex itself —
+          // on a sparse straight stretch the nearest vertex of the other hike can be tens of
+          // meters away along the trail even though the trail itself passes right by, and only the
+          // segment (the actual line between two of its points) captures that.
+          for (const [ia, ib] of [[q.i - 1, q.i], [q.i, q.i + 1]]) {
+            if (ia < 0 || ib >= otherCoords.length) continue;
+            const a = otherCoords[ia], b = otherCoords[ib];
+            if (pointToSegmentMeters([lat, lng], a, b) >= OVERLAP_THRESHOLD_M) continue;
+            const dLat = b[0] - a[0], dLng = b[1] - a[1];
+            const len = Math.hypot(dLat, dLng) || 1;
+            const [qLat, qLng] = [dLat / len, dLng / len];
+            if (Math.abs(tLat * qLat + tLng * qLng) < CROSS_HIKE_MIN_PARALLEL_DOT) continue; // crossing at an angle, not running alongside
+            otherSets[h.id][i].add(q.hikeId);
+            break;
+          }
         });
       });
     });
