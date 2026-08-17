@@ -9,7 +9,7 @@ const COLOR_EDITING = "#2980b9";  // rando en cours de modification / création
 // Bumped by hand on every change, shown in the sidebar footer — GitHub Pages can take a minute to
 // actually serve a new push, and the browser can also just be showing a cached copy, so this is
 // the one reliable way to confirm you're testing the version you think you're testing.
-const APP_VERSION = "v34 · 2026-08-17";
+const APP_VERSION = "v35 · 2026-08-17";
 document.getElementById("app-version").textContent = APP_VERSION;
 
 let leafletMap;
@@ -972,9 +972,22 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
       const cumDist = cumDistByHike[h.id];
       h.coordinates.forEach(([lat, lng], i) => {
         const [tLat, tLng] = crossTangentAt(h.coordinates, cumDist, i);
+        // Best (closest) qualifying match PER PARTNER, not the first one encountered — matters
+        // most when a partner ALSO does its own out-and-back nearby: its outbound and return legs
+        // can both sit within threshold of this point at once, and picking whichever segment
+        // happened to come first out of the spatial grid (effectively arbitrary) could jump
+        // between the two passes from one point of h to the next, even though they're headed
+        // opposite ways — exactly the kind of inconsistent edge that confuses the direction solver
+        // below. The genuinely nearest segment is far more likely to stay the SAME pass across
+        // consecutive points of h, since h is moving continuously while the two candidate passes
+        // stay put. Kept per-partner (not a single overall best) so a busy junction with several
+        // simultaneous partners still records all of them, not just the closest one.
+        const bestByPartner = new Map();
         neighborsOf(lat, lng).forEach((q) => {
-          if (q.hikeId === h.id || otherInfo[h.id][i].has(q.hikeId)) return;
+          if (q.hikeId === h.id) return;
           const otherCoords = hikeById.get(q.hikeId).coordinates;
+          const current = bestByPartner.get(q.hikeId);
+          const currentDist = current ? current.dist : Infinity;
           // Test against the two segments touching this candidate VERTEX, not the vertex itself —
           // on a sparse straight stretch the nearest vertex of the other hike can be tens of
           // meters away along the trail even though the trail itself passes right by, and only the
@@ -982,17 +995,18 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
           for (const [ia, ib] of [[q.i - 1, q.i], [q.i, q.i + 1]]) {
             if (ia < 0 || ib >= otherCoords.length) continue;
             const a = otherCoords[ia], b = otherCoords[ib];
-            if (pointToSegmentMeters([lat, lng], a, b) >= OVERLAP_THRESHOLD_M) continue;
+            const segDist = pointToSegmentMeters([lat, lng], a, b);
+            if (segDist >= OVERLAP_THRESHOLD_M || segDist >= currentDist) continue;
             const dLat = b[0] - a[0], dLng = b[1] - a[1];
             const len = Math.hypot(dLat, dLng) || 1;
             const [qLat, qLng] = [dLat / len, dLng / len];
             const dot = tLat * qLat + tLng * qLng;
             if (Math.abs(dot) < CROSS_HIKE_MIN_PARALLEL_DOT) continue; // crossing at an angle, not running alongside
             const matchedIndex = haversineMeters([lat, lng], a) <= haversineMeters([lat, lng], b) ? ia : ib;
-            otherInfo[h.id][i].set(q.hikeId, { matchedIndex, sign: dot >= 0 ? 1 : -1 });
-            break;
+            bestByPartner.set(q.hikeId, { dist: segDist, matchedIndex, sign: dot >= 0 ? 1 : -1 });
           }
         });
+        bestByPartner.forEach(({ matchedIndex, sign }, partnerId) => otherInfo[h.id][i].set(partnerId, { matchedIndex, sign }));
       });
     });
   }
@@ -1144,6 +1158,22 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
       });
     });
   });
+  // Self-merge edges: a return-leg point and the earlier-pass point it snaps onto in
+  // applyOverlapClusters (necessarily walked in roughly opposite directions, that's what a
+  // retrace IS) — connecting them lets applyOverlapClusters fall back to the RETURN point's own
+  // cross-hike info when the earlier pass didn't happen to detect a partner there itself (the two
+  // passes don't always get matched to a partner at exactly the same rate — e.g. a third hike out-
+  // and-backing alongside can be a slightly closer match to one pass than the other), instead of
+  // just losing the separation entirely.
+  hikeList.forEach((h) => {
+    filteredSelf[h.id].forEach((matched, i) => {
+      if (!matched) return;
+      const j = selfMatchIndex[h.id][i];
+      const tI = smoothedTangentByHike[h.id][i], tJ = smoothedTangentByHike[h.id][j];
+      const sign = tI.tLat * tJ.tLat + tI.tLng * tJ.tLng >= 0 ? 1 : -1;
+      union(nodeOf(h.id, i), nodeOf(h.id, j), sign);
+    });
+  });
   // Final canonical tangent for a point: its sign relative to its component's root, times a
   // reasonable default orientation picked for that root (northward-leaning, purely cosmetic —
   // any consistent choice works equally well since every OTHER node in the component is defined
@@ -1209,17 +1239,30 @@ function applyOverlapClusters(hikeList, clusters, zoom) {
   hikeList.forEach((h) => {
     const clusterInfo = clusters[h.id];
     result[h.id] = h.coordinates.map(([lat, lng], i) => {
-      let info = clusterInfo && clusterInfo[i];
-      if (!info) return [lat, lng];
+      const own = clusterInfo && clusterInfo[i];
+      if (!own) return [lat, lng];
+      let info = own;
       let baseLat = lat, baseLng = lng;
-      if (info.selfSnapToIndex != null) {
-        // Snap to the earlier pass's coordinate — and inherit ITS cross-hike info wholesale too,
-        // not just its position: this point's own perpendicular direction runs opposite to the
-        // earlier pass's (they travel in opposite directions along the same trail), so applying
-        // its own offset from the shared base would immediately shove the two "merged" points
-        // apart again, undoing the whole point of snapping them together.
-        [baseLat, baseLng] = h.coordinates[info.selfSnapToIndex];
-        info = clusterInfo[info.selfSnapToIndex] || null;
+      if (own.selfSnapToIndex != null) {
+        // Snap to the earlier pass's coordinate and prefer ITS cross-hike info — this point's own
+        // perpendicular is for a DIFFERENT base position (its own, before snapping), so it can
+        // only be applied relative to the snapped base if it's actually consistent with the
+        // earlier pass's own orientation (guaranteed by a dedicated union-find edge between the
+        // two passes — see buildOverlapClusters). Falls back to this point's OWN info when the
+        // earlier pass didn't detect any partner itself (e.g. a third hike out-and-backing
+        // alongside happened to match this pass more closely than the other) — better to still
+        // show the separation this pass DID find than silently drop it because the pass it snaps
+        // to came up empty.
+        [baseLat, baseLng] = h.coordinates[own.selfSnapToIndex]; // always snap position, regardless of offset info below
+        const earlier = clusterInfo[own.selfSnapToIndex];
+        if (earlier && earlier.laneOffset) {
+          info = earlier;
+        } else if (own.laneOffset) {
+          // keep `info = own` — apply this pass's own offset from the shared base, safe now that
+          // the self-merge union-find edge keeps its perpendicular consistent with that base.
+        } else {
+          return [baseLat, baseLng];
+        }
       }
       if (!info || !info.laneOffset) return [baseLat, baseLng];
       // laneOffset steps by exactly 1.0 between adjacent lanes (see buildOverlapClusters), so this
