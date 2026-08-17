@@ -9,7 +9,7 @@ const COLOR_EDITING = "#2980b9";  // rando en cours de modification / création
 // Bumped by hand on every change, shown in the sidebar footer — GitHub Pages can take a minute to
 // actually serve a new push, and the browser can also just be showing a cached copy, so this is
 // the one reliable way to confirm you're testing the version you think you're testing.
-const APP_VERSION = "v27 · 2026-08-17";
+const APP_VERSION = "v28 · 2026-08-17";
 document.getElementById("app-version").textContent = APP_VERSION;
 
 let leafletMap;
@@ -1104,7 +1104,12 @@ function buildOverlapClusters(hikeList, includeOtherHikes) {
       const coherence = Math.hypot(sumTLat, sumTLng) / (end - start);
       const tLen = Math.hypot(sumTLat, sumTLng) || 1;
       const [tLat, tLng] = [sumTLat / tLen, sumTLng / tLen];
-      return { otherRank: otherRank * coherence, selfSnapToIndex, perpLat: -tLng, perpLng: tLat };
+      // Floored at 0.7: a genuine hairpin still gets tapered (softening the direction flip) but
+      // can never lose more than 30% of its magnitude just because the trail curves — an uncapped
+      // multiplier was crushing the offset toward invisible on any real, moderately winding trail,
+      // not just at sharp switchback apexes.
+      const coherenceFactor = Math.max(coherence, 0.7);
+      return { otherRank: otherRank * coherenceFactor, selfSnapToIndex, perpLat: -tLng, perpLng: tLat };
     });
   });
 
@@ -1136,10 +1141,11 @@ function applyOverlapClusters(hikeList, clusters, zoom) {
       // Measured directly against a real saved pair (rank ±0.45, the typical single-partner case):
       // center-to-center came out to 7px — exactly the white halo's own width (haloWeight 7 on a
       // default-state line), meaning the two halos touched edge-to-edge with zero visible gap.
-      // 12 puts that same typical case at ~10-11px center-to-center — a modest few px of visible
-      // gap beyond the halo, not a wide dramatic split (a bigger constant was tried and made every
-      // pair look overly spread out).
-      const offsetStepM = 12 * metersPerPixel(baseLat, zoom);
+      // 15 puts that same typical case at ~13-14px center-to-center — enough margin beyond the
+      // halo to read clearly as two lines even on a real, imperfectly-clean overlap (12 measured
+      // too close to the halo edge once the direction-coherence damping above was added; 18 made
+      // every pair look overly spread out).
+      const offsetStepM = 15 * metersPerPixel(baseLat, zoom);
       const offsetDeg = (info.otherRank * offsetStepM) / 111320;
       return [baseLat + info.perpLat * offsetDeg, baseLng + info.perpLng * offsetDeg];
     });
